@@ -1,6 +1,6 @@
 # Main code
 add_library(mma_gcmma GCMMASolver.cpp)
-target_include_directories(mma_gcmma PUBLIC ..)
+target_include_directories(mma_gcmma PUBLIC .)
 
 # Let's get a little bit paranoid
 include(SetWarnings)
