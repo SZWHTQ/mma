@@ -94,8 +94,8 @@ int main(int argc, char *argv[]) {
 	Print(g.data(), toy.m, "g");
 
 	// Initialize GCMMA
-	GCMMASolver gcmma(toy.n, toy.m, 0, 1000, 1);
-	MMASolver mma(toy.n, toy.m, 0, 1000, 1);
+	mma::GCMMASolver gcmma(toy.n, toy.m, 0, 1000, 1);
+	mma::MMASolver mma(toy.n, toy.m, 0, 1000, 1);
 
 	double ch = 1.0;
 	int maxoutit = 8;

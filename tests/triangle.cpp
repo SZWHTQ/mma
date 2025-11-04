@@ -95,7 +95,7 @@ int main(int argc, char *argv[]) {
 	e[2*5+0] = 4; e[2*5+1] = 5;
 
 	// Initialize MMA
-	MMASolver *mma = new MMASolver(n,m);
+	mma::MMASolver *mma = new mma::MMASolver(n,m);
 
 	double ch = 1.0;
 	int itr = 0;

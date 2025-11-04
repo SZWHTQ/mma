@@ -70,7 +70,7 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Initialize MMA
-	MMASolver *mma = new MMASolver(n,m);
+	mma::MMASolver *mma = new mma::MMASolver(n,m);
 
 	double ch = 1.0;
 	int itr = 0;
