@@ -1,3 +1,4 @@
+#include <stdexcept>
 ////////////////////////////////////////////////////////////////////////////////
 // Copyright © 2018 Jérémie Dumas
 //
@@ -55,9 +56,21 @@ void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 
 void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
-                       const double* xmax) {
-    // Generate the subproblem
-    GenSub(xval, dfdx, gx, dgdx, xmin, xmax);
+                       const double* xmax, const double* move_scale) {
+    // Validate before changing solver history (and outside OpenMP regions).
+    if (move_scale) {
+        for (int i = 0; i < n; ++i) {
+            if (!std::isfinite(move_scale[i]) || move_scale[i] <= 0.0 ||
+                move_scale[i] > 1.0) {
+                throw std::invalid_argument("MMA local-bound scale must be finite and in (0, 1]");
+            }
+        }
+    }
+    last_bounds.alpha_standard.resize(n);
+    last_bounds.beta_standard.resize(n);
+    GenSub(xval, dfdx, gx, dgdx, xmin, xmax, move_scale);
+    last_bounds.alpha = alpha;
+    last_bounds.beta = beta;
 
     // Update xolds
     xold2 = xold1;
@@ -332,7 +345,7 @@ void MMASolver::XYZofLAMBDA(double* x) {
 
 void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
-                       const double* xmax) {
+                       const double* xmax, const double* move_scale) {
     // Forward the iterator
     iter++;
 
@@ -395,6 +408,15 @@ void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
         beta[i] = std::min(xmax[i], upp[i] - albefa * (upp[i] - xval[i]));
         beta[i] = std::min(beta[i], xval[i] + move * (xmax[i] - xmin[i]));
         beta[i] = std::max(beta[i], xmin[i]);
+
+        last_bounds.alpha_standard[i] = alpha[i];
+        last_bounds.beta_standard[i] = beta[i];
+        // Relative tightening of the already-formed asymmetric MMA interval.
+        // Skip identity scales to preserve the original floating-point path.
+        if (move_scale && move_scale[i] != 1.0) {
+            alpha[i] = xval[i] - move_scale[i] * (xval[i] - alpha[i]);
+            beta[i] = xval[i] + move_scale[i] * (beta[i] - xval[i]);
+        }
 
         // Objective function
         {
