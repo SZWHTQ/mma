@@ -66,11 +66,18 @@ class MMASolver {
     void ConstraintModification(bool conMod) {}
 
     void Update(double* xval, const double* dfdx, const double* gx,
-                const double* dgdx, const double* xmin, const double* xmax);
+                const double* dgdx, const double* xmin, const double* xmax,
+                const double* move_scale = nullptr);
+
+    struct LocalBounds {
+        std::vector<double> alpha_standard, beta_standard, alpha, beta;
+    };
+    const LocalBounds& LastLocalBounds() const noexcept { return last_bounds; }
 
     void Reset() { iter = 0; };
 
   private:
+    LocalBounds last_bounds;
     int n, m, iter;
 
     const double xmamieps;
@@ -90,7 +97,8 @@ class MMASolver {
     std::vector<double> xold1, xold2;
 
     void GenSub(const double* xval, const double* dfdx, const double* gx,
-                const double* dgdx, const double* xmin, const double* xmax);
+                const double* dgdx, const double* xmin, const double* xmax,
+                const double* move_scale);
 
     void SolveDSA(double* x);
     void SolveDIP(double* x);
