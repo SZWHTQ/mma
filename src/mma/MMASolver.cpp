@@ -43,7 +43,9 @@ MMASolver::MMASolver(int nn, int mm, double ai, double ci, double di)
       ,
       a(m, ai), c(m, ci), d(m, di), y(m), lam(m), mu(m), s(2 * m), low(n),
       upp(n), alpha(n), beta(n), p0(n), q0(n), pij(n * m), qij(n * m), b(m),
-      grad(m), hess(m * m), xold1(n), xold2(n) {}
+      grad(m), hess(m * m), xold1(n), xold2(n), m_committed_xold1(n),
+      m_committed_xold2(n), m_committed_low(n), m_committed_upp(n),
+      m_input_x(n) {}
 
 void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 
@@ -56,6 +58,10 @@ void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
                        const double* xmax) {
+    // The iteration state a solve is allowed to commit. Captured before GenSub
+    // so that a rejected solve can be undone exactly.
+    SnapshotIterationState(xval);
+
     // Generate the subproblem
     GenSub(xval, dfdx, gx, dgdx, xmin, xmax);
 
@@ -68,6 +74,110 @@ void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
 
     // Solve the dual with a steepest ascent method
     // SolveDSA(xval);
+
+    // Observe the returned dual point, then accept or reject it. A rejected
+    // solve restores the iteration state captured above and leaves the caller's
+    // design vector untouched, so a failed subproblem cannot advance the
+    // asymptote history or propose a garbage design step.
+    QualifyDualSolve(xval);
+    if (m_dual.status != DualSolveStatus::Success) {
+        RestoreIterationState(xval);
+    }
+}
+
+void MMASolver::SnapshotIterationState(const double* xval) {
+    m_dual.update_rejected = false;
+    m_committed_iter = iter;
+    m_committed_xold1 = xold1;
+    m_committed_xold2 = xold2;
+    m_committed_low = low;
+    m_committed_upp = upp;
+    m_input_x.assign(xval, xval + n);
+}
+
+void MMASolver::RestoreIterationState(double* xval) {
+    iter = m_committed_iter;
+    xold1 = m_committed_xold1;
+    xold2 = m_committed_xold2;
+    low = m_committed_low;
+    upp = m_committed_upp;
+    std::copy_n(m_input_x.begin(), n, xval);
+    m_dual.update_rejected = true;
+}
+
+/**
+ * Qualify the dual point SolveDIP returned. This is a pure observation: it reads
+ * the solver state and fills m_dual, and changes nothing the arithmetic depends
+ * on.
+ */
+void MMASolver::QualifyDualSolve(const double* x) {
+    m_dual.lambda = lam;
+    m_dual.mu = mu;
+    m_dual.epsimin = epsimin;
+    m_dual.dual_residual_tolerance = DualResidualToleranceFactor() * epsimin;
+
+    bool all_finite = std::isfinite(z);
+    for (int j = 0; j < m && all_finite; ++j) {
+        all_finite = std::isfinite(lam[j]) && std::isfinite(mu[j]) &&
+                     std::isfinite(y[j]);
+    }
+    for (int i = 0; i < n && all_finite; ++i) {
+        all_finite = std::isfinite(x[i]);
+    }
+    m_dual.all_finite = all_finite;
+
+    // XYZofLAMBDA clamps the primal iterate into [alpha, beta], so this holds by
+    // construction for any finite iterate; the check exists to catch a
+    // non-finite or otherwise corrupted box, not to re-derive the clamp.
+    bool within_box = true;
+    for (int i = 0; i < n; ++i) {
+        const double width = std::abs(beta[i] - alpha[i]);
+        const double tol = 1.0e-12 * std::max(1.0, width);
+        if (x[i] < alpha[i] - tol || x[i] > beta[i] + tol) {
+            within_box = false;
+        }
+    }
+    m_dual.design_within_subproblem_box = within_box;
+
+    double stationarity = 0.0;
+    double complementarity = 0.0;
+    DualResidualComponents(x, m_dual.epsi_final, &stationarity,
+                           &complementarity);
+    m_dual.dual_stationarity_residual = stationarity;
+    m_dual.dual_complementarity_residual = complementarity;
+    m_dual.dual_residual = std::max(stationarity, complementarity);
+
+    const bool residual_ok =
+        m_dual.dual_residual <= m_dual.dual_residual_tolerance;
+    const bool inner_ok =
+        m_dual.capped_barrier_levels < CappedBarrierLevelFailureThreshold();
+
+    m_dual.status = (all_finite && within_box && residual_ok && inner_ok)
+                        ? DualSolveStatus::Success
+                        : DualSolveStatus::FailedToConverge;
+}
+
+/**
+ * The two implemented components of the dual KKT residual, evaluated with the
+ * same expressions DualResidual uses. DualResidual itself is deliberately left
+ * untouched: it is the inner loop's own progress measure.
+ */
+void MMASolver::DualResidualComponents(const double* x, double epsi,
+                                       double* stationarity,
+                                       double* complementarity) const {
+    double stat = 0.0;
+    double compl_res = 0.0;
+    for (int j = 0; j < m; ++j) {
+        double res = -b[j] - a[j] * z - y[j] + mu[j];
+        for (int i = 0; i < n; ++i) {
+            res += pij[i * m + j] / (upp[i] - x[i]) +
+                   qij[i * m + j] / (x[i] - low[i]);
+        }
+        stat = std::max(stat, std::abs(res));
+        compl_res = std::max(compl_res, std::abs(mu[j] * lam[j] - epsi));
+    }
+    *stationarity = stat;
+    *complementarity = compl_res;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -86,11 +196,20 @@ void MMASolver::SolveDIP(double* x) {
     double err = 1.0;
     int loop;
 
+    // Observation counters only; they take no part in the arithmetic below.
+    m_dual.barrier_levels = 0;
+    m_dual.capped_barrier_levels = 0;
+    m_dual.inner_newton_iterations = 0;
+    m_dual.epsi_final = epsi;
+
     while (epsi > tol) {
 
         loop = 0;
+        m_dual.barrier_levels += 1;
+        m_dual.epsi_final = epsi;
         while (err > 0.9 * epsi && loop < 100) {
             loop++;
+            m_dual.inner_newton_iterations += 1;
 
             // Set up Newton system
             XYZofLAMBDA(x);
@@ -123,6 +242,12 @@ void MMASolver::SolveDIP(double* x) {
 
             // Compute KKT res
             err = DualResidual(x, epsi);
+        }
+        // The inner loop stops either because the residual test passed or
+        // because the iteration cap was reached. Only the second case is a
+        // stalled level.
+        if (loop >= 100 && err > 0.9 * epsi) {
+            m_dual.capped_barrier_levels += 1;
         }
         epsi = epsi * 0.1;
     }

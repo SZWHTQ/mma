@@ -56,6 +56,72 @@
 #include <vector>
 
 namespace mma {
+
+/**
+ * Outcome of the dual interior-point solve performed by the last Update().
+ *
+ * `Success` and `FailedToConverge` are the two programmatically distinguishable
+ * states a caller may branch on; a failure is never signalled by NaN, by a huge
+ * value, or by a log message.
+ */
+enum class DualSolveStatus {
+    NotRun,           ///< Update() has not been called yet.
+    Success,          ///< The returned dual point passed qualification.
+    FailedToConverge, ///< The returned dual point failed qualification.
+};
+
+/**
+ * Read-only report of the last dual (interior-point) solve.
+ *
+ * Everything here is a *record of what SolveDIP did*; none of it feeds back into
+ * the arithmetic. `lambda`/`mu` are copies of the returned dual variables, and
+ * the residuals are the value of the solver's own KKT residual expression at the
+ * returned point (see DualResidual) evaluated at `epsi_final`. Note that this is
+ * not the same number as the last residual the inner Newton loop evaluated: the
+ * inner loop never re-bases its residual between barrier levels, so a barrier
+ * level whose inner loop is skipped leaves the complementarity residual parked at
+ * the last *solved* level. The returned-point residual below is the honest
+ * measure of what was delivered, and it is the quantity the qualification test
+ * uses.
+ */
+struct DualSolveDiagnostics {
+    DualSolveStatus status = DualSolveStatus::NotRun;
+
+    /// Final dual variables of the returned point.
+    std::vector<double> lambda;
+    std::vector<double> mu;
+
+    /// Last barrier level the outer loop entered, and the tolerance it targets.
+    double epsi_final = 0.0;
+    double epsimin = 0.0;
+
+    /// Max-norm KKT residual of the returned point at `epsi_final`, split into
+    /// its two implemented components. `dual_residual == max(stationarity,
+    /// complementarity)` by construction.
+    double dual_residual = 0.0;
+    /// max_j |G_j + mu_j|  (dual stationarity / dual feasibility)
+    double dual_stationarity_residual = 0.0;
+    /// max_j |mu_j * lambda_j - epsi|  (the single complementarity relation the
+    /// vendored solver keeps)
+    double dual_complementarity_residual = 0.0;
+    /// The threshold `dual_residual` was tested against.
+    double dual_residual_tolerance = 0.0;
+
+    /// Inner Newton work, summed over all barrier levels.
+    int barrier_levels = 0;
+    int capped_barrier_levels = 0;
+    int inner_newton_iterations = 0;
+
+    /// Structural checks of the returned state.
+    bool all_finite = false;
+    bool design_within_subproblem_box = false;
+
+    /// True when the returned point failed qualification and the solver restored
+    /// the iteration state it had before this Update() call, so that the caller's
+    /// design vector is unchanged and the asymptote history is not advanced.
+    bool update_rejected = false;
+};
+
 class MMASolver {
 
   public:
@@ -69,6 +135,37 @@ class MMASolver {
                 const double* dgdx, const double* xmin, const double* xmax);
 
     void Reset() { iter = 0; };
+
+    // ==================================================================
+    // Read-only observability of the dual solve. These accessors report;
+    // they never modify MMA state.
+    // ==================================================================
+
+    /// Diagnostics of the dual solve performed by the most recent Update().
+    const DualSolveDiagnostics& GetDualSolveDiagnostics() const noexcept {
+        return m_dual;
+    }
+    DualSolveStatus GetDualSolveStatus() const noexcept {
+        return m_dual.status;
+    }
+    /// True only when the most recent Update() produced a qualified dual point.
+    bool LastDualSolveSucceeded() const noexcept {
+        return m_dual.status == DualSolveStatus::Success;
+    }
+    /// True when the most recent Update() was rejected and rolled back.
+    bool LastUpdateRejected() const noexcept { return m_dual.update_rejected; }
+
+    /// A returned dual point is accepted while its max-norm KKT residual stays
+    /// within this multiple of `epsimin`. The factor is a *qualification
+    /// threshold* calibrated against measured production behaviour, not a claim
+    /// that the solver reaches `epsimin`.
+    static double DualResidualToleranceFactor() noexcept { return 1.0e3; }
+
+    /// A solve is rejected once this many barrier levels have exhausted the
+    /// inner Newton cap. The vendored inner loop has no residual-decrease
+    /// acceptance test, so a cap-saturating level is the only in-solver evidence
+    /// that the barrier path stalled.
+    static int CappedBarrierLevelFailureThreshold() noexcept { return 4; }
 
   private:
     int n, m, iter;
@@ -88,6 +185,29 @@ class MMASolver {
     std::vector<double> low, upp, alpha, beta, p0, q0, pij, qij, b, grad, hess;
 
     std::vector<double> xold1, xold2;
+
+    /// Diagnostics of the last dual solve (see DualSolveDiagnostics).
+    DualSolveDiagnostics m_dual;
+
+    /// Iteration state that is committed by a solve and therefore has to be
+    /// restored when a solve is rejected. Only `iter`, the two previous design
+    /// vectors and the asymptotes carry over from one Update() to the next;
+    /// everything else GenSub produces is rebuilt from scratch.
+    int m_committed_iter = 0;
+    std::vector<double> m_committed_xold1, m_committed_xold2;
+    std::vector<double> m_committed_low, m_committed_upp;
+    std::vector<double> m_input_x;
+
+    /// Capture / restore the iteration state a solve is allowed to commit.
+    void SnapshotIterationState(const double* xval);
+    void RestoreIterationState(double* xval);
+
+    /// Qualify the dual point SolveDIP just returned, filling m_dual.
+    void QualifyDualSolve(const double* x);
+
+    /// residual components of the returned point (see DualSolveDiagnostics)
+    void DualResidualComponents(const double* x, double epsi, double* stationarity,
+                                double* complementarity) const;
 
     void GenSub(const double* xval, const double* dfdx, const double* gx,
                 const double* dgdx, const double* xmin, const double* xmax);
