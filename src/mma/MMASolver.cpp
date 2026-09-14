@@ -193,7 +193,6 @@ void MMASolver::SolveDIP(double* x) {
 
     const double tol = epsimin; // 1.0e-9*sqrt(m+n);
     double epsi = 1.0;
-    double err = 1.0;
     int loop;
 
     // Observation counters only; they take no part in the arithmetic below.
@@ -207,6 +206,24 @@ void MMASolver::SolveDIP(double* x) {
         loop = 0;
         m_dual.barrier_levels += 1;
         m_dual.epsi_final = epsi;
+
+        // Rebuild the residual at the top of every barrier level, from the
+        // current dual state and the current barrier parameter, as Svanberg's
+        // subsolv.m does. Nothing is carried in from the previous level: the
+        // old code kept `err` across levels, so a level was entered iff the
+        // residual measured at the previous level's (10x looser) epsi happened
+        // to exceed a threshold 10x tighter than the one it was measured
+        // against -- which is why barrier levels were skipped outright.
+        //
+        // `x`, `y` and `z` are slaved to `lam` in this reduced formulation, so
+        // the rebuild has to re-derive them first. At every level after the
+        // first the call is a no-op (the map lam -> x is idempotent and the
+        // previous level's inner loop always ended with an XYZofLAMBDA); at
+        // the first level it is mandatory, because `x` still holds the caller's
+        // design vector there and is not yet a function of `lam`.
+        XYZofLAMBDA(x);
+        double err = DualResidual(x, epsi);
+
         while (err > 0.9 * epsi && loop < 100) {
             loop++;
             m_dual.inner_newton_iterations += 1;
