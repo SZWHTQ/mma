@@ -156,10 +156,23 @@ class MMASolver {
     bool LastUpdateRejected() const noexcept { return m_dual.update_rejected; }
 
     /// A returned dual point is accepted while its max-norm KKT residual stays
-    /// within this multiple of `epsimin`. The factor is a *qualification
-    /// threshold* calibrated against measured production behaviour, not a claim
-    /// that the solver reaches `epsimin`.
-    static double DualResidualToleranceFactor() noexcept { return 1.0e3; }
+    /// within this multiple of `epsimin`.
+    ///
+    /// This is a *qualification threshold* calibrated against measured
+    /// production behaviour, not a claim that the solver reaches `epsimin`. The
+    /// largest residual measured on any solve that did NOT saturate the inner
+    /// Newton cap is 7066 * epsimin over the m7 matrix (n <= 32) and 1557 *
+    /// epsimin on the first update of the n = 1803 multi-material assembly
+    /// fixture; every solve that saturated the cap at four or more barrier
+    /// levels reaches at least 2.9e9 * epsimin except for the mild ones, which
+    /// the cap clause catches. The factor therefore sits one decade above every
+    /// measured non-stalling solve.
+    ///
+    /// The ratio does not shrink with problem size, so the `sqrt(n+m)` growth of
+    /// `epsimin` is not the right normalisation; a scale-relative measure of the
+    /// stationarity residual is the Phase 2 direction. See
+    /// docs/audits/mma-dual-reliability.md.
+    static double DualResidualToleranceFactor() noexcept { return 1.0e4; }
 
     /// A solve is rejected once this many barrier levels have exhausted the
     /// inner Newton cap. The vendored inner loop has no residual-decrease
