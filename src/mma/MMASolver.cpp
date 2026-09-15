@@ -23,7 +23,6 @@
 #include "MMASolver.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 
 namespace mma {
 ////////////////////////////////////////////////////////////////////////////////
@@ -41,9 +40,9 @@ MMASolver::MMASolver(int nn, int mm, double ai, double ci, double di)
       ,
       asyminc(1.2) // 1.08;
       ,
-      a(m, ai), c(m, ci), d(m, di), y(m), lam(m), mu(m), s(2 * m), low(n),
+      a(m, ai), c(m, ci), d(m, di), y(m), lam(m), mu(m), low(n),
       upp(n), alpha(n), beta(n), p0(n), q0(n), pij(n * m), qij(n * m), b(m),
-      grad(m), hess(m * m), xold1(n), xold2(n), m_committed_xold1(n),
+      xold1(n), xold2(n), m_committed_xold1(n),
       m_committed_xold2(n), m_committed_low(n), m_committed_upp(n),
       m_input_x(n) {}
 
@@ -114,7 +113,6 @@ void MMASolver::QualifyDualSolve(const double* x) {
     m_dual.lambda = lam;
     m_dual.mu = mu;
     m_dual.epsimin = epsimin;
-    m_dual.dual_residual_tolerance = DualResidualToleranceFactor() * epsimin;
 
     bool all_finite = std::isfinite(z);
     for (int j = 0; j < m && all_finite; ++j) {
@@ -139,17 +137,7 @@ void MMASolver::QualifyDualSolve(const double* x) {
     }
     m_dual.design_within_subproblem_box = within_box;
 
-    double stationarity = 0.0;
-    double complementarity = 0.0;
-    DualResidualComponents(x, m_dual.epsi_final, &stationarity,
-                           &complementarity);
-    m_dual.dual_stationarity_residual = stationarity;
-    m_dual.dual_complementarity_residual = complementarity;
-    m_dual.dual_residual = std::max(stationarity, complementarity);
-
     const bool finite_ok = all_finite && m_dual.all_finite;
-    const bool residual_ok =
-        m_dual.dual_residual <= m_dual.dual_residual_tolerance;
 
     // ---- the m9 acceptance policy -----------------------------------
     //
@@ -176,30 +164,6 @@ void MMASolver::QualifyDualSolve(const double* x) {
 
     m_dual.status = (structural_ok && kkt_ok) ? DualSolveStatus::Success
                                               : DualSolveStatus::FailedToConverge;
-    (void)residual_ok;  // kept computed for continuity with the Phase-1 contract
-}
-
-/**
- * The two implemented components of the dual KKT residual, evaluated with the
- * same expressions DualResidual uses. DualResidual itself is deliberately left
- * untouched: it is the inner loop's own progress measure.
- */
-void MMASolver::DualResidualComponents(const double* x, double epsi,
-                                       double* stationarity,
-                                       double* complementarity) const {
-    double stat = 0.0;
-    double compl_res = 0.0;
-    for (int j = 0; j < m; ++j) {
-        double res = -b[j] - a[j] * z - y[j] + mu[j];
-        for (int i = 0; i < n; ++i) {
-            res += pij[i * m + j] / (upp[i] - x[i]) +
-                   qij[i * m + j] / (x[i] - low[i]);
-        }
-        stat = std::max(stat, std::abs(res));
-        compl_res = std::max(compl_res, std::abs(mu[j] * lam[j] - epsi));
-    }
-    *stationarity = stat;
-    *complementarity = compl_res;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -264,294 +228,6 @@ void MMASolver::SolveDIP(double* x) {
     m_dual.backtracking_reductions = r.backtracking_reductions;
     m_dual.backtracking_max_reductions = r.backtracking_max_reductions;
     m_dual.backtracking_exhausted = r.backtracking_exhausted;
-}
-
-void MMASolver::SolveDIPReduced(double* x) {
-
-    for (int j = 0; j < m; j++) {
-        lam[j] = c[j] / 2.0;
-        mu[j] = 1.0;
-    }
-
-    const double tol = epsimin; // 1.0e-9*sqrt(m+n);
-    double epsi = 1.0;
-    int loop;
-
-    // Observation counters only; they take no part in the arithmetic below.
-    m_dual.barrier_levels = 0;
-    m_dual.capped_barrier_levels = 0;
-    m_dual.inner_newton_iterations = 0;
-    m_dual.epsi_final = epsi;
-
-    while (epsi > tol) {
-
-        loop = 0;
-        m_dual.barrier_levels += 1;
-        m_dual.epsi_final = epsi;
-
-        // Rebuild the residual at the top of every barrier level, from the
-        // current dual state and the current barrier parameter, as Svanberg's
-        // subsolv.m does. Nothing is carried in from the previous level: the
-        // old code kept `err` across levels, so a level was entered iff the
-        // residual measured at the previous level's (10x looser) epsi happened
-        // to exceed a threshold 10x tighter than the one it was measured
-        // against -- which is why barrier levels were skipped outright.
-        //
-        // `x`, `y` and `z` are slaved to `lam` in this reduced formulation, so
-        // the rebuild has to re-derive them first. At every level after the
-        // first the call is a no-op (the map lam -> x is idempotent and the
-        // previous level's inner loop always ended with an XYZofLAMBDA); at
-        // the first level it is mandatory, because `x` still holds the caller's
-        // design vector there and is not yet a function of `lam`.
-        XYZofLAMBDA(x);
-        double err = DualResidual(x, epsi);
-
-        while (err > 0.9 * epsi && loop < 100) {
-            loop++;
-            m_dual.inner_newton_iterations += 1;
-
-            // Set up Newton system
-            XYZofLAMBDA(x);
-            DualGrad(x);
-            for (int j = 0; j < m; j++) {
-                grad[j] = -1.0 * grad[j] - epsi / lam[j];
-            }
-            DualHess(x);
-
-            // Solve Newton system
-            if (m > 1) {
-                Factorize(hess.data(), m);
-                Solve(hess.data(), grad.data(), m);
-                for (int j = 0; j < m; j++) {
-                    s[j] = grad[j];
-                }
-            } else if (m > 0) {
-                s[0] = grad[0] / hess[0];
-            }
-
-            // Get the full search direction
-            for (int i = 0; i < m; i++) {
-                s[m + i] = -mu[i] + epsi / lam[i] - s[i] * mu[i] / lam[i];
-            }
-
-            // Perform linesearch and update lam and mu
-            DualLineSearch();
-
-            XYZofLAMBDA(x);
-
-            // Compute KKT res
-            err = DualResidual(x, epsi);
-        }
-        // The inner loop stops either because the residual test passed or
-        // because the iteration cap was reached. Only the second case is a
-        // stalled level.
-        if (loop >= 100 && err > 0.9 * epsi) {
-            m_dual.capped_barrier_levels += 1;
-        }
-        epsi = epsi * 0.1;
-    }
-}
-
-void MMASolver::SolveDSA(double* x) {
-
-    for (int j = 0; j < m; j++) {
-        lam[j] = 1.0;
-    }
-
-    const double tol = epsimin; // 1.0e-9*sqrt(m+n);
-    double err = 1.0;
-    int loop = 0;
-
-    while (err > tol && loop < 500) {
-        loop++;
-        XYZofLAMBDA(x);
-        DualGrad(x);
-        double theta = 1.0;
-        err = 0.0;
-        for (int j = 0; j < m; j++) {
-            lam[j] = std::max(0.0, lam[j] + theta * grad[j]);
-            err += grad[j] * grad[j];
-        }
-        err = std::sqrt(err);
-    }
-}
-
-double MMASolver::DualResidual(double* x, double epsi) {
-
-    double* res = new double[2 * m];
-
-    for (int j = 0; j < m; j++) {
-        res[j] = -b[j] - a[j] * z - y[j] + mu[j];
-        res[j + m] = mu[j] * lam[j] - epsi;
-        for (int i = 0; i < n; i++) {
-            res[j] += pij[i * m + j] / (upp[i] - x[i]) +
-                      qij[i * m + j] / (x[i] - low[i]);
-        }
-    }
-
-    double nrI = 0.0;
-    for (int i = 0; i < 2 * m; i++) {
-        if (nrI < std::abs(res[i])) {
-            nrI = std::abs(res[i]);
-        }
-    }
-
-    delete[] res;
-
-    return nrI;
-}
-
-void MMASolver::DualLineSearch() {
-
-    double theta = 1.005;
-    for (int i = 0; i < m; i++) {
-        if (theta < -1.01 * s[i] / lam[i]) {
-            theta = -1.01 * s[i] / lam[i];
-        }
-        if (theta < -1.01 * s[i + m] / mu[i]) {
-            theta = -1.01 * s[i + m] / mu[i];
-        }
-    }
-    theta = 1.0 / theta;
-
-    for (int i = 0; i < m; i++) {
-        lam[i] = lam[i] + theta * s[i];
-        mu[i] = mu[i] + theta * s[i + m];
-    }
-}
-
-void MMASolver::DualHess(double* x) {
-
-    double* df2 = new double[n];
-    double* PQ = new double[n * m];
-#ifdef MMA_WITH_OPENMP
-#pragma omp parallel for
-#endif
-    for (int i = 0; i < n; i++) {
-        double pjlam = p0[i];
-        double qjlam = q0[i];
-        for (int j = 0; j < m; j++) {
-            pjlam += pij[i * m + j] * lam[j];
-            qjlam += qij[i * m + j] * lam[j];
-            PQ[i * m + j] = pij[i * m + j] / pow(upp[i] - x[i], 2.0) -
-                            qij[i * m + j] / pow(x[i] - low[i], 2.0);
-        }
-        df2[i] = -1.0 / (2.0 * pjlam / pow(upp[i] - x[i], 3.0) +
-                         2.0 * qjlam / pow(x[i] - low[i], 3.0));
-        double xp = (sqrt(pjlam) * low[i] + sqrt(qjlam) * upp[i]) /
-                    (sqrt(pjlam) + sqrt(qjlam));
-        if (xp < alpha[i]) {
-            df2[i] = 0.0;
-        }
-        if (xp > beta[i]) {
-            df2[i] = 0.0;
-        }
-    }
-
-    // Create the matrix/matrix/matrix product: PQ^T * diag(df2) * PQ
-    double* tmp = new double[n * m];
-    for (int j = 0; j < m; j++) {
-#ifdef MMA_WITH_OPENMP
-#pragma omp parallel for
-#endif
-        for (int i = 0; i < n; i++) {
-            tmp[j * n + i] = 0.0;
-            tmp[j * n + i] += PQ[i * m + j] * df2[i];
-        }
-    }
-
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < m; j++) {
-            hess[i * m + j] = 0.0;
-            for (int k = 0; k < n; k++) {
-                hess[i * m + j] += tmp[i * n + k] * PQ[k * m + j];
-            }
-        }
-    }
-
-    double lamai = 0.0;
-    for (int j = 0; j < m; j++) {
-        if (lam[j] < 0.0) {
-            lam[j] = 0.0;
-        }
-        lamai += lam[j] * a[j];
-        if (lam[j] > c[j]) {
-            hess[j * m + j] += -1.0;
-        }
-        hess[j * m + j] += -mu[j] / lam[j];
-    }
-
-    if (lamai > 0.0) {
-        for (int j = 0; j < m; j++) {
-            for (int k = 0; k < m; k++) {
-                hess[j * m + k] += -10.0 * a[j] * a[k];
-            }
-        }
-    }
-
-    // pos def check
-    double HessTrace = 0.0;
-    for (int i = 0; i < m; i++) {
-        HessTrace += hess[i * m + i];
-    }
-    double HessCorr = 1e-4 * HessTrace / m;
-
-    if (-1.0 * HessCorr < 1.0e-7) {
-        HessCorr = -1.0e-7;
-    }
-
-    for (int i = 0; i < m; i++) {
-        hess[i * m + i] += HessCorr;
-    }
-
-    delete[] df2;
-    delete[] PQ;
-    delete[] tmp;
-}
-
-void MMASolver::DualGrad(double* x) {
-    for (int j = 0; j < m; j++) {
-        grad[j] = -b[j] - a[j] * z - y[j];
-        for (int i = 0; i < n; i++) {
-            grad[j] += pij[i * m + j] / (upp[i] - x[i]) +
-                       qij[i * m + j] / (x[i] - low[i]);
-        }
-    }
-}
-
-void MMASolver::XYZofLAMBDA(double* x) {
-
-    double lamai = 0.0;
-    for (int i = 0; i < m; i++) {
-        if (lam[i] < 0.0) {
-            lam[i] = 0;
-        }
-        y[i] = std::max(
-            0.0,
-            lam[i] - c[i]); // Note y=(lam-c)/d - however d is fixed at one !!
-        lamai += lam[i] * a[i];
-    }
-    z = std::max(0.0, 10.0 * (lamai - 1.0)); // SINCE a0 = 1.0
-
-#ifdef MMA_WITH_OPENMP
-#pragma omp parallel for
-#endif
-    for (int i = 0; i < n; i++) {
-        double pjlam = p0[i];
-        double qjlam = q0[i];
-        for (int j = 0; j < m; j++) {
-            pjlam += pij[i * m + j] * lam[j];
-            qjlam += qij[i * m + j] * lam[j];
-        }
-        x[i] = (sqrt(pjlam) * low[i] + sqrt(qjlam) * upp[i]) /
-               (sqrt(pjlam) + sqrt(qjlam));
-        if (x[i] < alpha[i]) {
-            x[i] = alpha[i];
-        }
-        if (x[i] > beta[i]) {
-            x[i] = beta[i];
-        }
-    }
 }
 
 void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
@@ -651,35 +327,4 @@ void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
     }
 }
 
-void MMASolver::Factorize(double* K, int n) {
-
-    for (int s = 0; s < n - 1; s++) {
-        for (int i = s + 1; i < n; i++) {
-            K[i * n + s] = K[i * n + s] / K[s * n + s];
-            for (int j = s + 1; j < n; j++) {
-                K[i * n + j] = K[i * n + j] - K[i * n + s] * K[s * n + j];
-            }
-        }
-    }
-}
-
-void MMASolver::Solve(double* K, double* x, int n) {
-
-    for (int i = 1; i < n; i++) {
-        double a = 0.0;
-        for (int j = 0; j < i; j++) {
-            a = a - K[i * n + j] * x[j];
-        }
-        x[i] = x[i] + a;
-    }
-
-    x[n - 1] = x[n - 1] / K[(n - 1) * n + (n - 1)];
-    for (int i = n - 2; i >= 0; i--) {
-        double a = x[i];
-        for (int j = i + 1; j < n; j++) {
-            a = a - K[i * n + j] * x[j];
-        }
-        x[i] = a / K[i * n + i];
-    }
-}
 } // namespace mma
