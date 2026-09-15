@@ -1,5 +1,5 @@
 # Main code
-add_library(mma_mma MMASolver.cpp)
+add_library(mma_mma MMASolver.cpp SubsolvFull.cpp)
 target_include_directories(mma_mma PUBLIC ..)
 
 # Let's get a little bit paranoid

@@ -147,14 +147,36 @@ void MMASolver::QualifyDualSolve(const double* x) {
     m_dual.dual_complementarity_residual = complementarity;
     m_dual.dual_residual = std::max(stationarity, complementarity);
 
+    const bool finite_ok = all_finite && m_dual.all_finite;
     const bool residual_ok =
         m_dual.dual_residual <= m_dual.dual_residual_tolerance;
-    const bool inner_ok =
-        m_dual.capped_barrier_levels < CappedBarrierLevelFailureThreshold();
 
-    m_dual.status = (all_finite && within_box && residual_ok && inner_ok)
-                        ? DualSolveStatus::Success
-                        : DualSolveStatus::FailedToConverge;
+    // ---- the m9 acceptance policy -----------------------------------
+    //
+    // Acceptance is decided by the quality of the returned point, not by how
+    // the solver got there. `capped_barrier_levels` stays observable but is
+    // NOT a failure clause on its own: m8 measured a fixture that saturates the
+    // inner cap and still delivers a residual 3e4x inside the threshold while
+    // converging to the analytic optimum (§9, G6).
+    //
+    // Structural clauses, any of which is fatal whatever the residual:
+    //   * every returned state entry is finite;
+    //   * the point lies inside its own domain (alfa <= x <= beta,
+    //     y,z,lam,mu,s,zet >= 0);
+    //   * the reference's Newton branch was taken as written.
+    // Quality clause: the full primal-dual KKT/barrier residual, which is the
+    // solver's own convergence measure, within `KktResidualToleranceFactor()`
+    // times epsimin.
+    m_dual.kkt_residual_tolerance = KktResidualToleranceFactor() * epsimin;
+    const bool kkt_ok = m_dual.kkt.max_norm <= m_dual.kkt_residual_tolerance &&
+                        std::isfinite(m_dual.kkt.max_norm);
+    const bool structural_ok = finite_ok && within_box &&
+                               m_dual.kkt_domain_ok &&
+                               !m_dual.kkt_unsupported_branch;
+
+    m_dual.status = (structural_ok && kkt_ok) ? DualSolveStatus::Success
+                                              : DualSolveStatus::FailedToConverge;
+    (void)residual_ok;  // kept computed for continuity with the Phase-1 contract
 }
 
 /**
@@ -184,7 +206,67 @@ void MMASolver::DualResidualComponents(const double* x, double epsi,
 // PRIVATE
 ////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * The solve path (m9): hand the generated subproblem to the full primal-dual
+ * solver and adopt what it returns.
+ *
+ * GenSub is untouched and produces exactly the quantities `subsolv.m` takes.
+ * The only conversion is the layout of P/Q: production stores them as
+ * `pij[i*m + j]` (design index i, constraint index j), the reference as
+ * `P(i,j)` with i the constraint, so the two are transposes of each other.
+ */
 void MMASolver::SolveDIP(double* x) {
+    SubsolvProblem sp;
+    sp.n = n;
+    sp.m = m;
+    sp.epsimin = epsimin;
+    sp.low = low;
+    sp.upp = upp;
+    sp.alfa = alpha;
+    sp.beta = beta;
+    sp.p0 = p0;
+    sp.q0 = q0;
+    sp.P.assign(static_cast<std::size_t>(m) * n, 0.0);
+    sp.Q.assign(static_cast<std::size_t>(m) * n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < m; ++j) {
+            sp.P[static_cast<std::size_t>(j) * n + i] = pij[i * m + j];
+            sp.Q[static_cast<std::size_t>(j) * n + i] = qij[i * m + j];
+        }
+    }
+    sp.a0 = 1.0;  // production's XYZofLAMBDA encodes a0 = 1
+    sp.a = a;
+    sp.b = b;
+    sp.c = c;
+    sp.d = d;
+
+    const SubsolvResult r = SolveSubsolvFull(sp);
+
+    if (r.x.size() == static_cast<std::size_t>(n)) {
+        std::copy(r.x.begin(), r.x.end(), x);
+    }
+    lam = r.lam;
+    mu = r.mu;
+    y = r.y;
+    z = r.z;
+
+    // Counters and residuals, for QualifyDualSolve.
+    m_dual.barrier_levels = r.barrier_levels;
+    m_dual.capped_barrier_levels = r.capped_barrier_levels;
+    m_dual.inner_newton_iterations = r.inner_newton_iterations;
+    m_dual.epsi_final = r.epsi_final;
+    m_dual.all_finite = r.all_finite;
+    m_dual.kkt = r.residual;
+    m_dual.kkt_domain_ok = r.domain_ok;
+    m_dual.kkt_unsupported_branch = r.unsupported_branch;
+    m_dual.full_step_iterations = r.full_step_iterations;
+    m_dual.backtracking_iterations = r.backtracking_iterations;
+    m_dual.backtracking_reductions = r.backtracking_reductions;
+    m_dual.backtracking_max_reductions = r.backtracking_max_reductions;
+    m_dual.backtracking_exhausted = r.backtracking_exhausted;
+}
+
+void MMASolver::SolveDIPReduced(double* x) {
 
     for (int j = 0; j < m; j++) {
         lam[j] = c[j] / 2.0;

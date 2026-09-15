@@ -53,6 +53,8 @@
 
 #pragma once
 
+#include "SubsolvFull.h"
+
 #include <vector>
 
 namespace mma {
@@ -116,6 +118,36 @@ struct DualSolveDiagnostics {
     bool all_finite = false;
     bool design_within_subproblem_box = false;
 
+    // ==================================================================
+    // Full primal-dual KKT/barrier residual of the returned point (m9).
+    //
+    // The reduced residual above only ever had two components (the
+    // constraint stationarity and one complementarity relation) because the
+    // reduced solver had no xsi/eta/zet/s state. With the full solver all
+    // nine reference equation groups are available and are the primary
+    // quality measure; `dual_residual` above is retained for continuity with
+    // the Phase-1 contract.
+    // ==================================================================
+    SubsolvResidual kkt;
+
+    /// The returned point lies inside its own domain: alfa <= x <= beta,
+    /// y,z,lam,mu,s,zet >= 0. A point outside it is a structural failure
+    /// whatever its residual.
+    bool kkt_domain_ok = false;
+    /// The reference's Newton-system branch could not be taken as written
+    /// (see SubsolvFull.cpp); always a failure, never a silent fallback.
+    bool kkt_unsupported_branch = false;
+    /// Threshold `kkt.max_norm` is tested against, in units of epsimin.
+    double kkt_residual_tolerance = 0.0;
+
+    /// Inner Newton iterations that accepted the full feasible step, and those
+    /// that needed backtracking.
+    int full_step_iterations = 0;
+    int backtracking_iterations = 0;
+    int backtracking_reductions = 0;
+    int backtracking_max_reductions = 0;
+    int backtracking_exhausted = 0;
+
     /// True when the returned point failed qualification and the solver restored
     /// the iteration state it had before this Update() call, so that the caller's
     /// design vector is unchanged and the asymptote history is not advanced.
@@ -174,10 +206,25 @@ class MMASolver {
     /// docs/audits/mma-dual-reliability.md.
     static double DualResidualToleranceFactor() noexcept { return 1.0e4; }
 
-    /// A solve is rejected once this many barrier levels have exhausted the
-    /// inner Newton cap. The vendored inner loop has no residual-decrease
-    /// acceptance test, so a cap-saturating level is the only in-solver evidence
-    /// that the barrier path stalled.
+    /// Acceptance threshold for the FULL primal-dual KKT/barrier residual of
+    /// the returned point, in units of `epsimin`.
+    ///
+    /// The reference's own convergence target is `epsimin`, so a solve that
+    /// converged should land near 1. This factor is the measured compatibility
+    /// band of the full solver, calibrated in the m9 study against the archived
+    /// reference oracle rather than chosen.
+    static double KktResidualToleranceFactor() noexcept { return 1.0e4; }
+
+    /// Retained for continuity with the Phase-1 contract and still reported in
+    /// the failure message.
+    ///
+    /// NO LONGER A FAILURE CLAUSE. Under the reduced solver a cap-saturating
+    /// level was the only in-solver evidence that the barrier path had stalled,
+    /// because that loop had no residual-decrease acceptance test. The full
+    /// solver does have one, and m8 measured a fixture that saturates the cap
+    /// while delivering a residual 3e4x inside the threshold; acceptance is now
+    /// decided by the full KKT residual (see KktResidualToleranceFactor).
+    /// `capped_barrier_levels` remains observable and is reported.
     static int CappedBarrierLevelFailureThreshold() noexcept { return 4; }
 
   private:
@@ -226,7 +273,21 @@ class MMASolver {
                 const double* dgdx, const double* xmin, const double* xmax);
 
     void SolveDSA(double* x);
+
+    /**
+     * The solve path. Builds the subproblem in the reference's layout and
+     * hands it to the full primal-dual solver (SubsolvFull.h), then adopts the
+     * returned state.
+     */
     void SolveDIP(double* x);
+
+    /**
+     * The former reduced-dual solve path, retained verbatim so that the two
+     * solvers can still be compared on the same subproblem. NOT called by
+     * Update(). It is scheduled for removal once the full solver is qualified
+     * on the outer benchmarks (m9 handoff section 23, item 4).
+     */
+    void SolveDIPReduced(double* x);
 
     void XYZofLAMBDA(double* x);
 
