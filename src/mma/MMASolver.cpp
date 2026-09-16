@@ -23,8 +23,40 @@
 #include "MMASolver.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace mma {
+
+namespace {
+
+std::uint64_t HashBytes(std::uint64_t hash, const void* data, std::size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::uint64_t HashVector(std::uint64_t hash, const std::vector<double>& values) {
+    const std::uint64_t size = values.size();
+    hash = HashBytes(hash, &size, sizeof(size));
+    return values.empty() ? hash : HashBytes(hash, values.data(), values.size() * sizeof(double));
+}
+
+std::uint64_t HashHistory(int iter, const std::vector<double>& xold1,
+                         const std::vector<double>& xold2,
+                         const std::vector<double>& low,
+                         const std::vector<double>& upp) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    hash = HashBytes(hash, &iter, sizeof(iter));
+    hash = HashVector(hash, xold1); hash = HashVector(hash, xold2);
+    hash = HashVector(hash, low); hash = HashVector(hash, upp);
+    return hash;
+}
+
+} // namespace
 ////////////////////////////////////////////////////////////////////////////////
 // PUBLIC
 ////////////////////////////////////////////////////////////////////////////////
@@ -79,9 +111,19 @@ void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
     // design vector untouched, so a failed subproblem cannot advance the
     // asymptote history or propose a garbage design step.
     QualifyDualSolve(xval);
+    m_replay_capture.candidate_design_hash =
+        HashBytes(1469598103934665603ULL, xval, sizeof(double) * n);
+    m_replay_capture.candidate_history_hash =
+        HashHistory(iter, xold1, xold2, low, upp);
     if (m_dual.status != DualSolveStatus::Success) {
         RestoreIterationState(xval);
     }
+    m_replay_capture.after_rejection_design_hash =
+        HashBytes(1469598103934665603ULL, xval, sizeof(double) * n);
+    m_replay_capture.after_rollback_history_hash =
+        HashHistory(iter, xold1, xold2, low, upp);
+    m_replay_capture.update_rejected = m_dual.update_rejected;
+    if (m_replay_callback) m_replay_callback(m_replay_capture);
 }
 
 void MMASolver::SnapshotIterationState(const double* xval) {
@@ -92,6 +134,31 @@ void MMASolver::SnapshotIterationState(const double* xval) {
     m_committed_low = low;
     m_committed_upp = upp;
     m_input_x.assign(xval, xval + n);
+    m_replay_capture = MmaReplayFixture{};
+    m_replay_capture.iteration = iter;
+    m_replay_capture.update_number = iter + 1;
+    m_replay_capture.n = n;
+    m_replay_capture.m = m;
+    m_replay_capture.xval = m_input_x;
+    m_replay_capture.xold1 = xold1;
+    m_replay_capture.xold2 = xold2;
+    m_replay_capture.low = low;
+    m_replay_capture.upp = upp;
+    m_replay_capture.a = a;
+    m_replay_capture.c = c;
+    m_replay_capture.d = d;
+    m_replay_capture.a0 = 1.0;
+    m_replay_capture.epsimin = epsimin;
+    m_replay_capture.xmamieps = xmamieps;
+    m_replay_capture.raa0 = raa0;
+    m_replay_capture.move = move;
+    m_replay_capture.albefa = albefa;
+    m_replay_capture.asyminit = asyminit;
+    m_replay_capture.asymdec = asymdec;
+    m_replay_capture.asyminc = asyminc;
+    m_replay_capture.before_design_hash =
+        HashBytes(1469598103934665603ULL, xval, sizeof(double) * n);
+    m_replay_capture.before_history_hash = HashHistory(iter, xold1, xold2, low, upp);
 }
 
 void MMASolver::RestoreIterationState(double* xval) {
@@ -204,7 +271,12 @@ void MMASolver::SolveDIP(double* x) {
     sp.c = c;
     sp.d = d;
 
+    m_replay_capture.problem = sp;
+    if (m_replay_pre_solve_callback) m_replay_pre_solve_callback(m_replay_capture);
+
     const SubsolvResult r = SolveSubsolvFull(sp);
+
+    m_replay_capture.result = r;
 
     if (r.x.size() == static_cast<std::size_t>(n)) {
         std::copy(r.x.begin(), r.x.end(), x);
@@ -235,6 +307,11 @@ void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
                        const double* xmax) {
     // Forward the iterator
     iter++;
+    m_replay_capture.dfdx.assign(dfdx, dfdx + n);
+    m_replay_capture.gx.assign(gx, gx + m);
+    m_replay_capture.dgdx.assign(dgdx, dgdx + n * m);
+    m_replay_capture.xmin.assign(xmin, xmin + n);
+    m_replay_capture.xmax.assign(xmax, xmax + n);
 
     // Set asymptotes
     if (iter < 3) {

@@ -23,6 +23,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 namespace mma {
 namespace {
@@ -168,6 +172,15 @@ SubsolvResidual EvaluateSubsolvResidual(const SubsolvProblem& p,
     r.remu = MaxAbs(remu);
     r.rezet = std::abs(rezet);
     r.res = MaxAbs(res);
+    r.rex_values = std::move(rex);
+    r.rey_values = std::move(rey);
+    r.relam_values = std::move(relam);
+    r.rexsi_values = std::move(rexsi);
+    r.reeta_values = std::move(reeta);
+    r.remu_values = std::move(remu);
+    r.res_values = std::move(res);
+    r.rez_value = rez;
+    r.rezet_value = rezet;
     r.norm2 = std::sqrt(s2);
     r.max_norm = std::max({r.rex, r.rey, r.rez, r.relam, r.rexsi, r.reeta, r.remu,
                            r.rezet, r.res});
@@ -534,6 +547,235 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
 
     out.residual = EvaluateSubsolvResidual(p, out, out.epsi_final);
     return out;
+}
+
+} // namespace mma
+
+namespace mma {
+namespace {
+
+constexpr char kReplayMagic[] = "MMARPLY1";
+
+template <typename T>
+void WritePod(std::ostream& out, const T& value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+    if (!out) throw std::runtime_error("failed writing MMA replay fixture");
+}
+
+template <typename T>
+T ReadPod(std::istream& in) {
+    T value{};
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    if (!in) throw std::runtime_error("truncated MMA replay fixture");
+    return value;
+}
+
+void WriteVector(std::ostream& out, const std::vector<double>& values) {
+    WritePod<std::uint64_t>(out, static_cast<std::uint64_t>(values.size()));
+    if (!values.empty()) {
+        out.write(reinterpret_cast<const char*>(values.data()),
+                  static_cast<std::streamsize>(values.size() * sizeof(double)));
+        if (!out) throw std::runtime_error("failed writing MMA replay vector");
+    }
+}
+
+std::vector<double> ReadVector(std::istream& in) {
+    const std::uint64_t size = ReadPod<std::uint64_t>(in);
+    if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(double))) {
+        throw std::runtime_error("invalid MMA replay vector size");
+    }
+    std::vector<double> values(static_cast<std::size_t>(size));
+    if (!values.empty()) {
+        in.read(reinterpret_cast<char*>(values.data()),
+                static_cast<std::streamsize>(values.size() * sizeof(double)));
+        if (!in) throw std::runtime_error("truncated MMA replay vector");
+    }
+    return values;
+}
+
+void WriteResidual(std::ostream& out, const SubsolvResidual& r) {
+    WriteVector(out, r.rex_values); WriteVector(out, r.rey_values);
+    WriteVector(out, r.relam_values); WriteVector(out, r.rexsi_values);
+    WriteVector(out, r.reeta_values); WriteVector(out, r.remu_values);
+    WriteVector(out, r.res_values);
+    WritePod(out, r.rez_value); WritePod(out, r.rezet_value);
+    WritePod(out, r.rex); WritePod(out, r.rey); WritePod(out, r.rez);
+    WritePod(out, r.relam); WritePod(out, r.rexsi); WritePod(out, r.reeta);
+    WritePod(out, r.remu); WritePod(out, r.rezet); WritePod(out, r.res);
+    WritePod(out, r.max_norm); WritePod(out, r.norm2);
+}
+
+SubsolvResidual ReadResidual(std::istream& in) {
+    SubsolvResidual r;
+    r.rex_values = ReadVector(in); r.rey_values = ReadVector(in);
+    r.relam_values = ReadVector(in); r.rexsi_values = ReadVector(in);
+    r.reeta_values = ReadVector(in); r.remu_values = ReadVector(in);
+    r.res_values = ReadVector(in);
+    r.rez_value = ReadPod<double>(in); r.rezet_value = ReadPod<double>(in);
+    r.rex = ReadPod<double>(in); r.rey = ReadPod<double>(in);
+    r.rez = ReadPod<double>(in); r.relam = ReadPod<double>(in);
+    r.rexsi = ReadPod<double>(in); r.reeta = ReadPod<double>(in);
+    r.remu = ReadPod<double>(in); r.rezet = ReadPod<double>(in);
+    r.res = ReadPod<double>(in); r.max_norm = ReadPod<double>(in);
+    r.norm2 = ReadPod<double>(in);
+    return r;
+}
+
+void WriteProblem(std::ostream& out, const SubsolvProblem& p) {
+    WritePod(out, p.n); WritePod(out, p.m); WritePod(out, p.epsimin);
+    WriteVector(out, p.low); WriteVector(out, p.upp); WriteVector(out, p.alfa);
+    WriteVector(out, p.beta); WriteVector(out, p.p0); WriteVector(out, p.q0);
+    WriteVector(out, p.P); WriteVector(out, p.Q); WritePod(out, p.a0);
+    WriteVector(out, p.a); WriteVector(out, p.b); WriteVector(out, p.c);
+    WriteVector(out, p.d);
+}
+
+SubsolvProblem ReadProblem(std::istream& in) {
+    SubsolvProblem p;
+    p.n = ReadPod<int>(in); p.m = ReadPod<int>(in);
+    p.epsimin = ReadPod<double>(in); p.low = ReadVector(in); p.upp = ReadVector(in);
+    p.alfa = ReadVector(in); p.beta = ReadVector(in); p.p0 = ReadVector(in);
+    p.q0 = ReadVector(in); p.P = ReadVector(in); p.Q = ReadVector(in);
+    p.a0 = ReadPod<double>(in); p.a = ReadVector(in); p.b = ReadVector(in);
+    p.c = ReadVector(in); p.d = ReadVector(in);
+    return p;
+}
+
+void WriteResult(std::ostream& out, const SubsolvResult& r) {
+    WriteVector(out, r.x); WriteVector(out, r.y); WritePod(out, r.z);
+    WriteVector(out, r.lam); WriteVector(out, r.xsi); WriteVector(out, r.eta);
+    WriteVector(out, r.mu); WritePod(out, r.zet); WriteVector(out, r.s);
+    WriteResidual(out, r.residual); WritePod(out, r.epsi_final);
+    WritePod(out, r.barrier_levels); WritePod(out, r.inner_newton_iterations);
+    WritePod(out, r.capped_barrier_levels);
+    WritePod(out, r.backtracking_iterations); WritePod(out, r.backtracking_reductions);
+    WritePod(out, r.backtracking_max_reductions);
+    WritePod(out, r.backtracking_exhausted); WritePod(out, r.full_step_iterations);
+    WritePod(out, r.domain_ok); WritePod(out, r.all_finite);
+    WritePod(out, r.unsupported_branch);
+}
+
+SubsolvResult ReadResult(std::istream& in) {
+    SubsolvResult r;
+    r.x = ReadVector(in); r.y = ReadVector(in); r.z = ReadPod<double>(in);
+    r.lam = ReadVector(in); r.xsi = ReadVector(in); r.eta = ReadVector(in);
+    r.mu = ReadVector(in); r.zet = ReadPod<double>(in); r.s = ReadVector(in);
+    r.residual = ReadResidual(in); r.epsi_final = ReadPod<double>(in);
+    r.barrier_levels = ReadPod<int>(in); r.inner_newton_iterations = ReadPod<int>(in);
+    r.capped_barrier_levels = ReadPod<int>(in);
+    r.backtracking_iterations = ReadPod<int>(in); r.backtracking_reductions = ReadPod<int>(in);
+    r.backtracking_max_reductions = ReadPod<int>(in);
+    r.backtracking_exhausted = ReadPod<int>(in); r.full_step_iterations = ReadPod<int>(in);
+    r.domain_ok = ReadPod<bool>(in); r.all_finite = ReadPod<bool>(in);
+    r.unsupported_branch = ReadPod<bool>(in);
+    return r;
+}
+
+void RequireClose(double a, double b, double tolerance, const char* what) {
+    if (a == b) return;
+    if (tolerance > 0.0 && std::abs(a - b) <= tolerance) return;
+    throw std::runtime_error(std::string("MMA replay mismatch: ") + what);
+}
+
+void RequireVector(const std::vector<double>& a, const std::vector<double>& b,
+                  double tolerance, const char* what) {
+    if (a.size() != b.size()) throw std::runtime_error(std::string("MMA replay size mismatch: ") + what);
+    for (std::size_t i = 0; i < a.size(); ++i) RequireClose(a[i], b[i], tolerance, what);
+}
+
+void VerifyResult(const SubsolvResult& expected, const SubsolvResult& actual,
+                  double tolerance) {
+    RequireVector(expected.x, actual.x, tolerance, "x");
+    RequireVector(expected.y, actual.y, tolerance, "y");
+    RequireClose(expected.z, actual.z, tolerance, "z");
+    RequireVector(expected.lam, actual.lam, tolerance, "lambda");
+    RequireVector(expected.xsi, actual.xsi, tolerance, "xsi");
+    RequireVector(expected.eta, actual.eta, tolerance, "eta");
+    RequireVector(expected.mu, actual.mu, tolerance, "mu");
+    RequireClose(expected.zet, actual.zet, tolerance, "zet");
+    RequireVector(expected.s, actual.s, tolerance, "s");
+    const auto& e = expected.residual; const auto& a = actual.residual;
+    RequireVector(e.rex_values, a.rex_values, tolerance, "rex values");
+    RequireVector(e.rey_values, a.rey_values, tolerance, "rey values");
+    RequireVector(e.relam_values, a.relam_values, tolerance, "relam values");
+    RequireVector(e.rexsi_values, a.rexsi_values, tolerance, "rexsi values");
+    RequireVector(e.reeta_values, a.reeta_values, tolerance, "reeta values");
+    RequireVector(e.remu_values, a.remu_values, tolerance, "remu values");
+    RequireVector(e.res_values, a.res_values, tolerance, "res values");
+    RequireClose(e.rez_value, a.rez_value, tolerance, "rez value");
+    RequireClose(e.rezet_value, a.rezet_value, tolerance, "rezet value");
+    RequireClose(e.max_norm, a.max_norm, tolerance, "max norm");
+    RequireClose(e.norm2, a.norm2, tolerance, "norm2");
+    if (expected.barrier_levels != actual.barrier_levels ||
+        expected.inner_newton_iterations != actual.inner_newton_iterations ||
+        expected.capped_barrier_levels != actual.capped_barrier_levels ||
+        expected.domain_ok != actual.domain_ok || expected.all_finite != actual.all_finite ||
+        expected.unsupported_branch != actual.unsupported_branch) {
+        throw std::runtime_error("MMA replay diagnostic mismatch");
+    }
+}
+
+} // namespace
+
+void WriteMmaReplayFixture(const MmaReplayFixture& f, const std::string& path) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot open MMA replay fixture for writing");
+    out.write(kReplayMagic, sizeof(kReplayMagic) - 1);
+    WritePod(out, f.format_version); WritePod(out, f.iteration);
+    WritePod(out, f.update_number); WritePod(out, f.n); WritePod(out, f.m);
+    WriteVector(out, f.xval); WriteVector(out, f.xold1); WriteVector(out, f.xold2);
+    WriteVector(out, f.xmin); WriteVector(out, f.xmax); WriteVector(out, f.low);
+    WriteVector(out, f.upp); WriteVector(out, f.dfdx); WriteVector(out, f.gx);
+    WriteVector(out, f.dgdx); WriteVector(out, f.df0dx); WriteVector(out, f.fval);
+    WriteVector(out, f.a); WriteVector(out, f.c); WriteVector(out, f.d);
+    WritePod(out, f.a0); WritePod(out, f.f0val); WritePod(out, f.objective_values_supplied);
+    WritePod(out, f.epsimin); WritePod(out, f.xmamieps); WritePod(out, f.raa0);
+    WritePod(out, f.move); WritePod(out, f.albefa); WritePod(out, f.asyminit);
+    WritePod(out, f.asymdec); WritePod(out, f.asyminc);
+    WriteProblem(out, f.problem); WriteResult(out, f.result);
+    WritePod(out, f.objective_value); WritePod(out, f.constraint_value_norm);
+    WritePod(out, f.before_design_hash); WritePod(out, f.candidate_design_hash);
+    WritePod(out, f.after_rejection_design_hash); WritePod(out, f.before_history_hash);
+    WritePod(out, f.candidate_history_hash); WritePod(out, f.after_rollback_history_hash);
+    WritePod(out, f.update_rejected);
+}
+
+MmaReplayFixture ReadMmaReplayFixture(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open MMA replay fixture for reading");
+    char magic[sizeof(kReplayMagic) - 1]{};
+    in.read(magic, sizeof(magic));
+    if (!in || std::string(magic, sizeof(magic)) != std::string(kReplayMagic, sizeof(kReplayMagic) - 1))
+        throw std::runtime_error("invalid MMA replay fixture magic");
+    MmaReplayFixture f;
+    f.format_version = ReadPod<std::uint32_t>(in);
+    if (f.format_version != MmaReplayFixture::kFormatVersion)
+        throw std::runtime_error("unsupported MMA replay fixture version");
+    f.iteration = ReadPod<int>(in); f.update_number = ReadPod<int>(in);
+    f.n = ReadPod<int>(in); f.m = ReadPod<int>(in);
+    f.xval = ReadVector(in); f.xold1 = ReadVector(in); f.xold2 = ReadVector(in);
+    f.xmin = ReadVector(in); f.xmax = ReadVector(in); f.low = ReadVector(in);
+    f.upp = ReadVector(in); f.dfdx = ReadVector(in); f.gx = ReadVector(in);
+    f.dgdx = ReadVector(in); f.df0dx = ReadVector(in); f.fval = ReadVector(in);
+    f.a = ReadVector(in); f.c = ReadVector(in); f.d = ReadVector(in);
+    f.a0 = ReadPod<double>(in); f.f0val = ReadPod<double>(in);
+    f.objective_values_supplied = ReadPod<bool>(in);
+    f.epsimin = ReadPod<double>(in); f.xmamieps = ReadPod<double>(in);
+    f.raa0 = ReadPod<double>(in); f.move = ReadPod<double>(in);
+    f.albefa = ReadPod<double>(in); f.asyminit = ReadPod<double>(in);
+    f.asymdec = ReadPod<double>(in); f.asyminc = ReadPod<double>(in);
+    f.problem = ReadProblem(in); f.result = ReadResult(in);
+    f.objective_value = ReadPod<double>(in); f.constraint_value_norm = ReadPod<double>(in);
+    f.before_design_hash = ReadPod<std::uint64_t>(in); f.candidate_design_hash = ReadPod<std::uint64_t>(in);
+    f.after_rejection_design_hash = ReadPod<std::uint64_t>(in);
+    f.before_history_hash = ReadPod<std::uint64_t>(in); f.candidate_history_hash = ReadPod<std::uint64_t>(in);
+    f.after_rollback_history_hash = ReadPod<std::uint64_t>(in); f.update_rejected = ReadPod<bool>(in);
+    return f;
+}
+
+void VerifyMmaReplayFixture(const MmaReplayFixture& fixture, double tolerance) {
+    const SubsolvResult actual = SolveSubsolvFull(fixture.problem);
+    VerifyResult(fixture.result, actual, tolerance);
 }
 
 } // namespace mma

@@ -55,6 +55,8 @@
 
 #include "SubsolvFull.h"
 
+#include <functional>
+#include <utility>
 #include <vector>
 
 namespace mma {
@@ -144,6 +146,20 @@ class MMASolver {
     void Update(double* xval, const double* dfdx, const double* gx,
                 const double* dgdx, const double* xmin, const double* xmax);
 
+    /// Install an optional observer for exact, immutable subproblem captures.
+    /// The observer is diagnostic only and never participates in arithmetic.
+    void SetReplayCaptureCallback(
+        std::function<void(const MmaReplayFixture&)> callback) {
+        m_replay_callback = std::move(callback);
+    }
+
+    /// Optional boundary observer invoked after the generated SubsolvProblem
+    /// is complete and immediately before SolveSubsolvFull is entered.
+    void SetReplayPreSolveCallback(
+        std::function<void(const MmaReplayFixture&)> callback) {
+        m_replay_pre_solve_callback = std::move(callback);
+    }
+
     void Reset() { iter = 0; };
 
     // ==================================================================
@@ -205,6 +221,10 @@ class MMASolver {
     std::vector<double> m_committed_low, m_committed_upp;
     std::vector<double> m_input_x;
 
+    std::function<void(const MmaReplayFixture&)> m_replay_callback;
+    std::function<void(const MmaReplayFixture&)> m_replay_pre_solve_callback;
+    MmaReplayFixture m_replay_capture;
+
     /// Capture / restore the iteration state a solve is allowed to commit.
     void SnapshotIterationState(const double* xval);
     void RestoreIterationState(double* xval);
@@ -221,6 +241,12 @@ class MMASolver {
      * returned state.
      */
     void SolveDIP(double* x);
+
+    void FinalizeReplayCapture(const SubsolvProblem& problem,
+                               const SubsolvResult& result,
+                               const double* xval, const double* dfdx,
+                               const double* gx, const double* dgdx,
+                               const double* xmin, const double* xmax);
 
 };
 } // namespace mma

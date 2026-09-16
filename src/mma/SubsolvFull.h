@@ -39,6 +39,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace mma {
@@ -50,6 +52,14 @@ namespace mma {
  * that group's vector.
  */
 struct SubsolvResidual {
+    // Full equation vectors, retained before norm reduction for replay and
+    // independent audit. The scalar fields below remain the production
+    // compatibility interface and are computed from these vectors.
+    std::vector<double> rex_values, rey_values, relam_values, rexsi_values,
+        reeta_values, remu_values, res_values;
+    double rez_value = 0.0;
+    double rezet_value = 0.0;
+
     /// x stationarity: dpsidx - xsi + eta                          (subsolv 72)
     double rex = 0.0;
     /// y stationarity: c + d.*y - mu - lam                         (subsolv 73)
@@ -150,6 +160,66 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& problem);
 SubsolvResidual EvaluateSubsolvResidual(const SubsolvProblem& problem,
                                         const SubsolvResult& point,
                                         double epsi);
+
+/**
+ * Versioned, self-contained capture of one exact production MMA call.
+ *
+ * The binary representation is deliberately separate from the scientific
+ * results/checkpoint formats: it is a replay artifact for the subproblem
+ * boundary, not a restart format.
+ */
+struct MmaReplayFixture {
+    static constexpr std::uint32_t kFormatVersion = 1;
+
+    std::uint32_t format_version = kFormatVersion;
+    int iteration = 0;
+    int update_number = 0;
+    int n = 0;
+    int m = 0;
+
+    // Exact public Update inputs and persistent MMA state.
+    std::vector<double> xval, xold1, xold2, xmin, xmax;
+    std::vector<double> low, upp;
+    std::vector<double> dfdx, gx, dgdx;
+    std::vector<double> df0dx, fval;
+    std::vector<double> a, c, d;
+    double a0 = 1.0;
+    double f0val = 0.0;
+    bool objective_values_supplied = false;
+    double epsimin = 0.0;
+    double xmamieps = 0.0;
+    double raa0 = 0.0;
+    double move = 0.0;
+    double albefa = 0.0;
+    double asyminit = 0.0;
+    double asymdec = 0.0;
+    double asyminc = 0.0;
+
+    // Exact generated input to subsolv, including derived bounds.
+    SubsolvProblem problem;
+
+    // Exact returned primal-dual state and diagnostics.
+    SubsolvResult result;
+    double objective_value = 0.0; // recorded only when supplied by caller
+    double constraint_value_norm = 0.0;
+
+    // Transaction hashes: FNV-1a over canonical little-endian scalar bytes.
+    std::uint64_t before_design_hash = 0;
+    std::uint64_t candidate_design_hash = 0;
+    std::uint64_t after_rejection_design_hash = 0;
+    std::uint64_t before_history_hash = 0;
+    std::uint64_t candidate_history_hash = 0;
+    std::uint64_t after_rollback_history_hash = 0;
+    bool update_rejected = false;
+};
+
+void WriteMmaReplayFixture(const MmaReplayFixture& fixture,
+                           const std::string& path);
+MmaReplayFixture ReadMmaReplayFixture(const std::string& path);
+
+/** Solve only the frozen subproblem and compare its returned state/residual. */
+void VerifyMmaReplayFixture(const MmaReplayFixture& fixture,
+                            double tolerance = 0.0);
 
 /// Reference constants that are part of `subsolv.m`'s control logic.
 struct SubsolvConstants {
