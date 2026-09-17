@@ -144,7 +144,13 @@ class MMASolver {
     void ConstraintModification(bool conMod) {}
 
     void Update(double* xval, const double* dfdx, const double* gx,
-                const double* dgdx, const double* xmin, const double* xmax);
+                const double* dgdx, const double* xmin, const double* xmax,
+                const double* move_scale = nullptr);
+
+    struct LocalBounds {
+        std::vector<double> alpha_standard, beta_standard, alpha, beta;
+    };
+    const LocalBounds& LastLocalBounds() const noexcept { return last_bounds; }
 
     /// Install an optional observer for exact, immutable subproblem captures.
     /// The observer is diagnostic only and never participates in arithmetic.
@@ -191,6 +197,7 @@ class MMASolver {
     static double KktResidualToleranceFactor() noexcept { return 1.0e4; }
 
   private:
+    LocalBounds last_bounds;
     int n, m, iter;
 
     const double xmamieps;
@@ -233,7 +240,8 @@ class MMASolver {
     void QualifyDualSolve(const double* x);
 
     void GenSub(const double* xval, const double* dfdx, const double* gx,
-                const double* dgdx, const double* xmin, const double* xmax);
+                const double* dgdx, const double* xmin, const double* xmax,
+                const double* move_scale);
 
     /**
      * The solve path. Builds the subproblem in the reference's layout and

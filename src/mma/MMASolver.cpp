@@ -1,3 +1,4 @@
+#include <stdexcept>
 ////////////////////////////////////////////////////////////////////////////////
 // Copyright © 2018 Jérémie Dumas
 //
@@ -304,7 +305,7 @@ void MMASolver::SolveDIP(double* x) {
 
 void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
-                       const double* xmax) {
+                       const double* xmax, const double* move_scale) {
     // Forward the iterator
     iter++;
     m_replay_capture.dfdx.assign(dfdx, dfdx + n);
@@ -372,6 +373,15 @@ void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
         beta[i] = std::min(xmax[i], upp[i] - albefa * (upp[i] - xval[i]));
         beta[i] = std::min(beta[i], xval[i] + move * (xmax[i] - xmin[i]));
         beta[i] = std::max(beta[i], xmin[i]);
+
+        last_bounds.alpha_standard[i] = alpha[i];
+        last_bounds.beta_standard[i] = beta[i];
+        // Relative tightening of the already-formed asymmetric MMA interval.
+        // Skip identity scales to preserve the original floating-point path.
+        if (move_scale && move_scale[i] != 1.0) {
+            alpha[i] = xval[i] - move_scale[i] * (xval[i] - alpha[i]);
+            beta[i] = xval[i] + move_scale[i] * (beta[i] - xval[i]);
+        }
 
         // Objective function
         {
