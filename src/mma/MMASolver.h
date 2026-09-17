@@ -103,6 +103,23 @@ struct DualSolveDiagnostics {
     int max_newton_iterations_per_barrier = 0;
     int extra_newton_iterations = 0;
 
+    /// How the progress-aware termination policy ended each stage. These are
+    /// the same counters `SubsolvResult` returns; without them a caller can see
+    /// that a solve succeeded but not why it stopped.
+    /// Barrier levels explicitly stopped after persistent lack of progress.
+    int stagnated_barrier_levels = 0;
+    /// Barrier levels stopped by the generous emergency work limit.
+    int emergency_limited_barrier_levels = 0;
+    /// Last measured relative reduction when a stage was classified stagnant.
+    double stagnation_relative_reduction = 0.0;
+    /// Newton iterations at which the policy's window test was performed.
+    int progress_policy_tests = 0;
+    /// Low-progress window comparisons observed (short-circuit limited).
+    int low_progress_windows = 0;
+    /// Smallest newest-window relative reduction seen; meaningful only when
+    /// `progress_policy_tests > 0`.
+    double minimum_window_relative_reduction = 0.0;
+
     /// Structural checks of the returned state.
     bool all_finite = false;
     bool design_within_subproblem_box = false;

@@ -143,9 +143,34 @@ enum class SubsolvProgressDecision {
 };
 
 /**
+ * Bookkeeping of ONE evaluation of the progress policy's window test.
+ *
+ * Every field records what `Decide` inspected, never what it decided, so
+ * filling a report cannot move a solve. `windows_tested` is short-circuit
+ * limited: `Decide` returns at the first window that shows adequate progress,
+ * so under a `Continue` verdict it counts only the comparisons needed to reach
+ * that window -- a lower bound on the windows the policy looked at, never an
+ * upper one.
+ */
+struct SubsolvProgressReport {
+    /// At least one window comparison was actually performed.
+    bool tested = false;
+    /// Window comparisons performed before the verdict was reached.
+    int windows_tested = 0;
+    /// Those comparisons whose relative reduction did not exceed the threshold.
+    int low_progress_windows = 0;
+    /// Relative reduction of the newest window at the last comparison.
+    /// Meaningful only when `tested`.
+    double newest_window_relative_reduction = 0.0;
+};
+
+/**
  * Scale-insensitive, solver-level progress monitor. The history is indexed by
  * Newton iteration within one barrier stage and contains the full residual
  * 2-norm, including the stage-start value at index zero.
+ *
+ * `report` is an optional pure-observation out-parameter; passing it changes
+ * no decision and no arithmetic.
  */
 struct SubsolvProgressPolicy {
     int window = 20;
@@ -153,8 +178,9 @@ struct SubsolvProgressPolicy {
     double minimum_relative_reduction = 1.0e-6;
 
     SubsolvProgressDecision Decide(const std::vector<double>& residual_history,
-                                   int iteration,
-                                   int soft_budget) const noexcept;
+                                   int iteration, int soft_budget,
+                                   SubsolvProgressReport* report = nullptr)
+        const noexcept;
 };
 
 /** Explicitly opt-in diagnostic controls; defaults select the production policy. */
@@ -213,6 +239,17 @@ struct SubsolvResult {
     int emergency_limited_barrier_levels = 0;
     /// Last measured relative reduction when a stage was classified stagnant.
     double stagnation_relative_reduction = 0.0;
+
+    /// Newton iterations at which the progress policy's window test was
+    /// performed, i.e. where the stage had enough post-soft-cap history for the
+    /// policy to judge. Zero means the policy never became decisive.
+    int progress_policy_tests = 0;
+    /// Low-progress window comparisons observed across those tests, summed
+    /// over all stages. Short-circuit limited -- see SubsolvProgressReport.
+    int low_progress_windows = 0;
+    /// Smallest newest-window relative reduction seen at any comparison.
+    /// Meaningful only when `progress_policy_tests > 0`.
+    double minimum_window_relative_reduction = 0.0;
 
     int backtracking_iterations = 0;   ///< Newton iterations needing >=1 halving
     int backtracking_reductions = 0;   ///< halvings summed over the solve

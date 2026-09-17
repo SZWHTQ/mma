@@ -316,6 +316,14 @@ void MMASolver::SolveDIP(double* x) {
     m_dual.max_newton_iterations_per_barrier =
         r.max_newton_iterations_per_barrier;
     m_dual.extra_newton_iterations = r.extra_newton_iterations;
+    m_dual.stagnated_barrier_levels = r.stagnated_barrier_levels;
+    m_dual.emergency_limited_barrier_levels =
+        r.emergency_limited_barrier_levels;
+    m_dual.stagnation_relative_reduction = r.stagnation_relative_reduction;
+    m_dual.progress_policy_tests = r.progress_policy_tests;
+    m_dual.low_progress_windows = r.low_progress_windows;
+    m_dual.minimum_window_relative_reduction =
+        r.minimum_window_relative_reduction;
     m_dual.epsi_final = r.epsi_final;
     m_dual.all_finite = r.all_finite;
     m_dual.kkt = r.residual;

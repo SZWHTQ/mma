@@ -136,8 +136,8 @@ double SubsolvResidual::worst_component() const {
 }
 
 SubsolvProgressDecision SubsolvProgressPolicy::Decide(
-    const std::vector<double>& residual_history, int iteration,
-    int soft_budget) const noexcept {
+    const std::vector<double>& residual_history, int iteration, int soft_budget,
+    SubsolvProgressReport* const report) const noexcept {
     if (window <= 0 || consecutive_windows <= 0 ||
         minimum_relative_reduction < 0.0 || iteration < 0 ||
         iteration < soft_budget + window * consecutive_windows ||
@@ -157,9 +157,18 @@ SubsolvProgressDecision SubsolvProgressPolicy::Decide(
         const double relative_reduction =
             (residual_history[older] - residual_history[newer]) /
             residual_history[older];
+        // Bookkeeping only: recorded after the comparison is well defined and
+        // before it is acted on, so the verdict below is bit-for-bit the one
+        // this function returned before the report existed.
+        if (report != nullptr) {
+            report->tested = true;
+            report->windows_tested += 1;
+            report->newest_window_relative_reduction = relative_reduction;
+        }
         if (!(relative_reduction <= minimum_relative_reduction)) {
             return SubsolvProgressDecision::Continue;
         }
+        if (report != nullptr) report->low_progress_windows += 1;
     }
     return SubsolvProgressDecision::Stagnated;
 }
@@ -268,6 +277,9 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
     bool hard_cap_exhausted = false;
     bool emergency_work_limit_exhausted = false;
     bool stagnated = false;
+    // Observation-only: distinguishes "no window comparison was ever made"
+    // from "a comparison measured a reduction of exactly zero".
+    bool window_reduction_seen = false;
 
     // ---- 1. primal-dual initialization (subsolv.m 42-58) ----
     std::vector<double> x(n), y(m), lam(m), xsi(n), eta(n), mu(m), s(m);
@@ -649,22 +661,39 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
 
             stage_residual_history.push_back(residunorm);
             if (!explicit_cap &&
-                residumax > SubsolvConstants::InnerResidualFactor() * epsi &&
-                options.progress_policy.Decide(stage_residual_history, ittt,
-                                               soft_iteration_cap) ==
-                    SubsolvProgressDecision::Stagnated) {
-                stagnated = true;
-                out.stagnated_barrier_levels += 1;
-                const int w = options.progress_policy.window;
-                if (w > 0 && ittt >= w) {
-                    const double old_residual = stage_residual_history[ittt - w];
-                    const double new_residual = stage_residual_history[ittt];
-                    if (old_residual > 0.0) {
-                        out.stagnation_relative_reduction =
-                            (old_residual - new_residual) / old_residual;
+                residumax > SubsolvConstants::InnerResidualFactor() * epsi) {
+                SubsolvProgressReport progress;
+                const SubsolvProgressDecision decision =
+                    options.progress_policy.Decide(
+                        stage_residual_history, ittt, soft_iteration_cap,
+                        &progress);
+                if (progress.tested) {
+                    out.progress_policy_tests += 1;
+                    out.low_progress_windows += progress.low_progress_windows;
+                    if (!window_reduction_seen ||
+                        progress.newest_window_relative_reduction <
+                            out.minimum_window_relative_reduction) {
+                        out.minimum_window_relative_reduction =
+                            progress.newest_window_relative_reduction;
+                        window_reduction_seen = true;
                     }
                 }
-                break;
+                if (decision == SubsolvProgressDecision::Stagnated) {
+                    stagnated = true;
+                    out.stagnated_barrier_levels += 1;
+                    const int w = options.progress_policy.window;
+                    if (w > 0 && ittt >= w) {
+                        const double old_residual =
+                            stage_residual_history[ittt - w];
+                        const double new_residual =
+                            stage_residual_history[ittt];
+                        if (old_residual > 0.0) {
+                            out.stagnation_relative_reduction =
+                                (old_residual - new_residual) / old_residual;
+                        }
+                    }
+                    break;
+                }
             }
 
             if (!std::isfinite(rr.max_norm) || !std::isfinite(rr.norm2)) {
