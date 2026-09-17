@@ -89,13 +89,28 @@ void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 
 void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
-                       const double* xmax) {
+                       const double* xmax, const double* move_scale) {
+    if (move_scale) {
+        for (int i = 0; i < n; ++i) {
+            if (!std::isfinite(move_scale[i]) || move_scale[i] <= 0.0 ||
+                move_scale[i] > 1.0) {
+                throw std::invalid_argument(
+                    "MMA move_scale entries must be finite and in (0, 1]");
+            }
+        }
+    }
+
     // The iteration state a solve is allowed to commit. Captured before GenSub
     // so that a rejected solve can be undone exactly.
     SnapshotIterationState(xval);
 
+    last_bounds.alpha_standard.resize(n);
+    last_bounds.beta_standard.resize(n);
+
     // Generate the subproblem
-    GenSub(xval, dfdx, gx, dgdx, xmin, xmax);
+    GenSub(xval, dfdx, gx, dgdx, xmin, xmax, move_scale);
+    last_bounds.alpha = alpha;
+    last_bounds.beta = beta;
 
     // Update xolds
     xold2 = xold1;
