@@ -89,13 +89,28 @@ void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 
 void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
-                       const double* xmax) {
+                       const double* xmax, const double* move_scale) {
+    if (move_scale) {
+        for (int i = 0; i < n; ++i) {
+            if (!std::isfinite(move_scale[i]) || move_scale[i] <= 0.0 ||
+                move_scale[i] > 1.0) {
+                throw std::invalid_argument(
+                    "MMA move_scale entries must be finite and in (0, 1]");
+            }
+        }
+    }
+
     // The iteration state a solve is allowed to commit. Captured before GenSub
     // so that a rejected solve can be undone exactly.
     SnapshotIterationState(xval);
 
+    last_bounds.alpha_standard.resize(n);
+    last_bounds.beta_standard.resize(n);
+
     // Generate the subproblem
-    GenSub(xval, dfdx, gx, dgdx, xmin, xmax);
+    GenSub(xval, dfdx, gx, dgdx, xmin, xmax, move_scale);
+    last_bounds.alpha = alpha;
+    last_bounds.beta = beta;
 
     // Update xolds
     xold2 = xold1;
@@ -207,13 +222,13 @@ void MMASolver::QualifyDualSolve(const double* x) {
 
     const bool finite_ok = all_finite && m_dual.all_finite;
 
-    // ---- the m9 acceptance policy -----------------------------------
+    // ---- the m17g acceptance policy ---------------------------------
     //
-    // Acceptance is decided by the quality of the returned point, not by how
-    // the solver got there. `capped_barrier_levels` stays observable but is
-    // NOT a failure clause on its own: m8 measured a fixture that saturates the
-    // inner cap and still delivers a residual 3e4x inside the threshold while
-    // converging to the analytic optimum (§9, G6).
+    // Acceptance is decided by the quality of the returned point and by the
+    // full solver's explicit convergence status. A soft-cap crossing is
+    // allowed only when the same stage continues and converges; hard-cap,
+    // numerical, and domain outcomes are never accepted based on residual
+    // proximity to the outer reliability band.
     //
     // Structural clauses, any of which is fatal whatever the residual:
     //   * every returned state entry is finite;
@@ -224,7 +239,12 @@ void MMASolver::QualifyDualSolve(const double* x) {
     // solver's own convergence measure, within `KktResidualToleranceFactor()`
     // times epsimin.
     m_dual.kkt_residual_tolerance = KktResidualToleranceFactor() * epsimin;
-    const bool kkt_ok = m_dual.kkt.max_norm <= m_dual.kkt_residual_tolerance &&
+    const bool inner_status_ok =
+        m_dual.subsolv_status == SubsolvSolveStatus::ConvergedWithinSoftCap ||
+        m_dual.subsolv_status ==
+            SubsolvSolveStatus::ConvergedAfterSoftCapExtension;
+    const bool kkt_ok = inner_status_ok &&
+                        m_dual.kkt.max_norm <= m_dual.kkt_residual_tolerance &&
                         std::isfinite(m_dual.kkt.max_norm);
     const bool structural_ok = finite_ok && within_box &&
                                m_dual.kkt_domain_ok &&
@@ -291,6 +311,11 @@ void MMASolver::SolveDIP(double* x) {
     m_dual.barrier_levels = r.barrier_levels;
     m_dual.capped_barrier_levels = r.capped_barrier_levels;
     m_dual.inner_newton_iterations = r.inner_newton_iterations;
+    m_dual.subsolv_status = r.status;
+    m_dual.extended_barrier_levels = r.extended_barrier_levels;
+    m_dual.max_newton_iterations_per_barrier =
+        r.max_newton_iterations_per_barrier;
+    m_dual.extra_newton_iterations = r.extra_newton_iterations;
     m_dual.epsi_final = r.epsi_final;
     m_dual.all_finite = r.all_finite;
     m_dual.kkt = r.residual;

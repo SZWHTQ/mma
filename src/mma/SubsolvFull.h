@@ -40,10 +40,21 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace mma {
+
+/** Read-only outcome of one full primal-dual subproblem solve. */
+enum class SubsolvSolveStatus {
+    NotRun,
+    ConvergedWithinSoftCap,
+    ConvergedAfterSoftCapExtension,
+    HardCapExhausted,
+    NumericalFailure,
+    DomainFailure,
+};
 
 /**
  * Full KKT / barrier residual of the subproblem, using the reference's own
@@ -104,8 +115,40 @@ struct SubsolvProblem {
     std::vector<double> a, b, c, d;
 };
 
+/** One behavior-neutral observation emitted by an explicitly traced solve. */
+struct SubsolvTraceRecord {
+    const char* event = ""; // barrier_start, newton_step, or barrier_end
+    int barrier_level = 0;
+    int newton_iteration = 0;
+    int newton_iteration_in_barrier = 0;
+    double epsi = 0.0;
+    double rex = 0.0, rey = 0.0, rez = 0.0, relam = 0.0;
+    double rexsi = 0.0, reeta = 0.0, remu = 0.0, rezet = 0.0, res = 0.0;
+    double max_norm = 0.0;
+    double norm2 = 0.0;
+    double newton_step_norm = 0.0;
+    int backtracking_trials = 0;
+    int backtracking_reductions = 0;
+    bool domain_ok = false;
+    bool all_finite = false;
+    bool linear_system_ok = true;
+};
+
+/** Explicitly opt-in diagnostic controls; defaults select the production policy. */
+struct SubsolvSolveOptions {
+    // Zero selects the production policy (200-iteration soft cap and the
+    // hard safety cap). A positive value is an explicit diagnostic hard cap.
+    int inner_iteration_cap = 0;
+    // Diagnostic-only compatibility mode: retain later barrier records after
+    // a deliberately low cap, but still return HardCapExhausted.
+    bool stop_on_hard_cap = true;
+    std::function<void(const SubsolvTraceRecord&)> trace;
+};
+
 /// Everything `subsolv.m` returns, plus the diagnostics this project needs.
 struct SubsolvResult {
+    SubsolvSolveStatus status = SubsolvSolveStatus::NotRun;
+
     /// n
     std::vector<double> x;
     /// m
@@ -129,7 +172,14 @@ struct SubsolvResult {
     double epsi_final = 0.0;
     int barrier_levels = 0;
     int inner_newton_iterations = 0;
+    /// Barrier levels that exhausted the absolute hard cap.
     int capped_barrier_levels = 0;
+    /// Barrier levels that crossed the historical soft cap and were extended.
+    int extended_barrier_levels = 0;
+    /// Maximum Newton iterations used by any one barrier level.
+    int max_newton_iterations_per_barrier = 0;
+    /// Newton iterations performed after soft-cap saturation.
+    int extra_newton_iterations = 0;
 
     int backtracking_iterations = 0;   ///< Newton iterations needing >=1 halving
     int backtracking_reductions = 0;   ///< halvings summed over the solve
@@ -153,6 +203,10 @@ struct SubsolvResult {
  * `subsolv.m`. Pure function of the problem: no global state, no I/O.
  */
 SubsolvResult SolveSubsolvFull(const SubsolvProblem& problem);
+
+/** Traced/extended offline solve. The equations and globalization are unchanged. */
+SubsolvResult SolveSubsolvFull(const SubsolvProblem& problem,
+                               const SubsolvSolveOptions& options);
 
 /// The full KKT/barrier residual of a point, evaluated with the reference's
 /// equations. Exposed so that a returned solution can be scored independently
@@ -223,8 +277,10 @@ void VerifyMmaReplayFixture(const MmaReplayFixture& fixture,
 
 /// Reference constants that are part of `subsolv.m`'s control logic.
 struct SubsolvConstants {
-    /// Inner Newton cap, `ittt < 200` (subsolv.m line 87).
+    /// Historical per-stage work budget, `ittt < 200` (subsolv.m line 87).
     static int InnerIterationCap() noexcept { return 200; }
+    /// Absolute per-stage safety ceiling for the extended policy.
+    static int HardIterationCap() noexcept { return 1100; }
     /// Backtracking budget, `itto < 50` (subsolv.m line 175).
     static int BacktrackingReductionLimit() noexcept { return 50; }
     /// Barrier reduction, `epsi = 0.1*epsi` (subsolv.m line 219).

@@ -153,7 +153,11 @@ bool GCMMASolver::SolveCurrentSubproblem(double* xmma) {
     m_diagnostics.subsolv = SolveSubsolvFull(problem);
     const SubsolvResult& result = m_diagnostics.subsolv;
     m_diagnostics.subsolv_history.push_back(result);
-    if (!result.all_finite || !result.domain_ok || result.unsupported_branch ||
+    const bool inner_converged =
+        result.status == SubsolvSolveStatus::ConvergedWithinSoftCap ||
+        result.status == SubsolvSolveStatus::ConvergedAfterSoftCapExtension;
+    if (!inner_converged || !result.all_finite || !result.domain_ok ||
+        result.unsupported_branch ||
         !std::isfinite(result.residual.max_norm) ||
         result.residual.max_norm >
             MMASolver::KktResidualToleranceFactor() * epsimin) {

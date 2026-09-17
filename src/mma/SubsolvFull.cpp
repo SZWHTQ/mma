@@ -96,6 +96,39 @@ double MaxAbs(const std::vector<double>& v) {
     return r;
 }
 
+void EmitTrace(const SubsolvSolveOptions& options, SubsolvTraceRecord record) {
+    if (options.trace) options.trace(record);
+}
+
+bool TraceDomainOk(const SubsolvProblem& p, const SubsolvResult& q) {
+    if (!std::isfinite(q.z) || !std::isfinite(q.zet) || q.z < 0.0 || q.zet < 0.0) {
+        return false;
+    }
+    for (int j = 0; j < p.n; ++j) {
+        if (!std::isfinite(q.x[j]) || !std::isfinite(q.xsi[j]) ||
+            !std::isfinite(q.eta[j]) || q.x[j] < p.alfa[j] || q.x[j] > p.beta[j] ||
+            q.xsi[j] < 0.0 || q.eta[j] < 0.0) return false;
+    }
+    for (int i = 0; i < p.m; ++i) {
+        if (!std::isfinite(q.y[i]) || !std::isfinite(q.lam[i]) ||
+            !std::isfinite(q.mu[i]) || !std::isfinite(q.s[i]) || q.y[i] < 0.0 ||
+            q.lam[i] < 0.0 || q.mu[i] < 0.0 || q.s[i] < 0.0) return false;
+    }
+    return true;
+}
+
+double TraceStepNorm(const std::vector<double>& dx, const std::vector<double>& dy,
+                     double dz, const std::vector<double>& dlam,
+                     const std::vector<double>& dxsi, const std::vector<double>& deta,
+                     const std::vector<double>& dmu, double dzet,
+                     const std::vector<double>& ds, double scale) {
+    double sum = dz * dz + dzet * dzet;
+    for (const auto* v : {&dx, &dy, &dlam, &dxsi, &deta, &dmu, &ds}) {
+        for (double x : *v) sum += x * x;
+    }
+    return std::abs(scale) * std::sqrt(sum);
+}
+
 } // namespace
 
 double SubsolvResidual::worst_component() const {
@@ -188,9 +221,21 @@ SubsolvResidual EvaluateSubsolvResidual(const SubsolvProblem& p,
 }
 
 SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
+    return SolveSubsolvFull(p, SubsolvSolveOptions{});
+}
+
+SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
+                              const SubsolvSolveOptions& options) {
     const int n = p.n, m = p.m;
     const double epsimin = p.epsimin;
+    const int soft_iteration_cap = SubsolvConstants::InnerIterationCap();
+    const int hard_iteration_cap = options.inner_iteration_cap > 0
+                                       ? options.inner_iteration_cap
+                                       : SubsolvConstants::HardIterationCap();
     SubsolvResult out;
+    bool numerical_failure = false;
+    bool domain_failure = false;
+    bool hard_cap_exhausted = false;
 
     // ---- 1. primal-dual initialization (subsolv.m 42-58) ----
     std::vector<double> x(n), y(m), lam(m), xsi(n), eta(n), mu(m), s(m);
@@ -229,10 +274,34 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
         out.barrier_levels += 1;
         out.epsi_final = epsi;
         int ittt = 0;
+        bool stage_extended = false;
+
+        {
+            SubsolvResult cur;
+            cur.x = x; cur.y = y; cur.z = z; cur.lam = lam;
+            cur.xsi = xsi; cur.eta = eta; cur.mu = mu; cur.zet = zet; cur.s = s;
+            const SubsolvResidual r = EvaluateSubsolvResidual(p, cur, epsi);
+            SubsolvTraceRecord record;
+            record.event = "barrier_start";
+            record.barrier_level = out.barrier_levels;
+            record.newton_iteration = out.inner_newton_iterations;
+            record.epsi = epsi;
+            record.rex = r.rex; record.rey = r.rey; record.rez = r.rez;
+            record.relam = r.relam; record.rexsi = r.rexsi; record.reeta = r.reeta;
+            record.remu = r.remu; record.rezet = r.rezet; record.res = r.res;
+            record.max_norm = r.max_norm; record.norm2 = r.norm2;
+            record.domain_ok = TraceDomainOk(p, cur);
+            record.all_finite = record.domain_ok;
+            EmitTrace(options, record);
+        }
 
         // ---- 4-10. inner Newton loop (subsolv.m 87-214) ----
         while (residumax > SubsolvConstants::InnerResidualFactor() * epsi &&
-               ittt < SubsolvConstants::InnerIterationCap()) {
+               ittt < hard_iteration_cap) {
+            // The historical first 200 steps are unchanged. If the stage is
+            // still not converged, continue from this exact state without
+            // reinitializing any primal-dual or Newton quantity.
+            if (ittt >= soft_iteration_cap) stage_extended = true;
             ittt += 1;
             out.inner_newton_iterations += 1;
 
@@ -330,7 +399,16 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
                 AA[m * (m + 1) + m] = -zet / z;
 
                 if (!SolveDense(AA, bb, m + 1)) {
+                    SubsolvTraceRecord record;
+                    record.event = "newton_step";
+                    record.barrier_level = out.barrier_levels;
+                    record.newton_iteration = out.inner_newton_iterations;
+                    record.newton_iteration_in_barrier = ittt;
+                    record.epsi = epsi;
+                    record.linear_system_ok = false;
+                    EmitTrace(options, record);
                     out.unsupported_branch = true;
+                    numerical_failure = true;
                     break;
                 }
                 for (int i = 0; i < m; ++i) dlam[i] = bb[i];
@@ -399,7 +477,16 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
                 }
                 AA[n * (n + 1) + n] = azz;
                 if (!SolveDense(AA, bb, n + 1)) {
+                    SubsolvTraceRecord record;
+                    record.event = "newton_step";
+                    record.barrier_level = out.barrier_levels;
+                    record.newton_iteration = out.inner_newton_iterations;
+                    record.newton_iteration_in_barrier = ittt;
+                    record.epsi = epsi;
+                    record.linear_system_ok = false;
+                    EmitTrace(options, record);
                     out.unsupported_branch = true;
+                    numerical_failure = true;
                     break;
                 }
                 for (int j = 0; j < n; ++j) dx[j] = bb[j];
@@ -508,18 +595,74 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
             cur.xsi = xsi; cur.eta = eta; cur.mu = mu; cur.zet = zet; cur.s = s;
             const SubsolvResidual rr = EvaluateSubsolvResidual(p, cur, epsi);
             residumax = rr.max_norm;
+            SubsolvTraceRecord record;
+            record.event = "newton_step";
+            record.barrier_level = out.barrier_levels;
+            record.newton_iteration = out.inner_newton_iterations;
+            record.newton_iteration_in_barrier = ittt;
+            record.epsi = epsi;
+            record.rex = rr.rex; record.rey = rr.rey; record.rez = rr.rez;
+            record.relam = rr.relam; record.rexsi = rr.rexsi; record.reeta = rr.reeta;
+            record.remu = rr.remu; record.rezet = rr.rezet; record.res = rr.res;
+            record.max_norm = rr.max_norm; record.norm2 = rr.norm2;
+            record.newton_step_norm = TraceStepNorm(
+                dx, dy, dz, dlam, dxsi, deta, dmu, dzet, ds, steg * 2.0);
+            record.backtracking_trials = itto;
+            record.backtracking_reductions = reductions;
+            record.domain_ok = TraceDomainOk(p, cur);
+            record.all_finite = record.domain_ok;
+            EmitTrace(options, record);
             steg = 2.0 * steg;
+
+            if (!std::isfinite(rr.max_norm) || !std::isfinite(rr.norm2)) {
+                numerical_failure = true;
+                break;
+            }
         }
 
-        // A level that exhausted the inner cap is recorded, never used on its
-        // own to reject the solve (m9 handoff section 9).
-        if (ittt >= SubsolvConstants::InnerIterationCap() &&
+        out.max_newton_iterations_per_barrier =
+            std::max(out.max_newton_iterations_per_barrier, ittt);
+        if (stage_extended) {
+            out.extended_barrier_levels += 1;
+            out.extra_newton_iterations +=
+                std::max(0, ittt - soft_iteration_cap);
+        }
+
+        // The soft cap is only a work-budget boundary. Exhaustion of the
+        // absolute ceiling is an explicit failure, never normal completion.
+        if (!numerical_failure && !domain_failure &&
+            ittt >= hard_iteration_cap &&
             residumax > SubsolvConstants::InnerResidualFactor() * epsi) {
             out.capped_barrier_levels += 1;
+            hard_cap_exhausted = true;
+        }
+
+        {
+            SubsolvResult cur;
+            cur.x = x; cur.y = y; cur.z = z; cur.lam = lam;
+            cur.xsi = xsi; cur.eta = eta; cur.mu = mu; cur.zet = zet; cur.s = s;
+            const SubsolvResidual r = EvaluateSubsolvResidual(p, cur, epsi);
+            SubsolvTraceRecord record;
+            record.event = "barrier_end";
+            record.barrier_level = out.barrier_levels;
+            record.newton_iteration = out.inner_newton_iterations;
+            record.newton_iteration_in_barrier = ittt;
+            record.epsi = epsi;
+            record.rex = r.rex; record.rey = r.rey; record.rez = r.rez;
+            record.relam = r.relam; record.rexsi = r.rexsi; record.reeta = r.reeta;
+            record.remu = r.remu; record.rezet = r.rezet; record.res = r.res;
+            record.max_norm = r.max_norm; record.norm2 = r.norm2;
+            record.domain_ok = TraceDomainOk(p, cur);
+            record.all_finite = record.domain_ok;
+            EmitTrace(options, record);
         }
 
         // ---- 11. next barrier level (subsolv.m 219) ----
         epsi = epsi * SubsolvConstants::BarrierReduction();
+        if (numerical_failure || domain_failure ||
+            (hard_cap_exhausted && options.stop_on_hard_cap)) {
+            break;
+        }
     }
 
     // ---- return (subsolv.m 221-229) ----
@@ -546,6 +689,18 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p) {
     out.domain_ok = in_domain;
 
     out.residual = EvaluateSubsolvResidual(p, out, out.epsi_final);
+    if (numerical_failure || out.unsupported_branch || !out.all_finite ||
+        !std::isfinite(out.residual.max_norm)) {
+        out.status = SubsolvSolveStatus::NumericalFailure;
+    } else if (domain_failure || !out.domain_ok) {
+        out.status = SubsolvSolveStatus::DomainFailure;
+    } else if (hard_cap_exhausted) {
+        out.status = SubsolvSolveStatus::HardCapExhausted;
+    } else if (out.extended_barrier_levels > 0) {
+        out.status = SubsolvSolveStatus::ConvergedAfterSoftCapExtension;
+    } else {
+        out.status = SubsolvSolveStatus::ConvergedWithinSoftCap;
+    }
     return out;
 }
 
@@ -683,6 +838,71 @@ void RequireVector(const std::vector<double>& a, const std::vector<double>& b,
     for (std::size_t i = 0; i < a.size(); ++i) RequireClose(a[i], b[i], tolerance, what);
 }
 
+void RequireDimension(const char* field, std::size_t actual,
+                      std::size_t expected) {
+    if (actual != expected) {
+        throw std::runtime_error(std::string("INVALID_FIXTURE_DIMENSION: ") +
+                                 field + " has size " +
+                                 std::to_string(actual) + ", expected " +
+                                 std::to_string(expected));
+    }
+}
+
+void ValidateMmaReplayFixtureDimensions(const MmaReplayFixture& f) {
+    if (f.n < 0 || f.m < 0) {
+        throw std::runtime_error(
+            "INVALID_FIXTURE_DIMENSION: negative header dimension");
+    }
+    const std::size_t n = static_cast<std::size_t>(f.n);
+    const std::size_t m = static_cast<std::size_t>(f.m);
+    const std::size_t nm = n * m;
+    RequireDimension("xval", f.xval.size(), n);
+    RequireDimension("xold1", f.xold1.size(), n);
+    RequireDimension("xold2", f.xold2.size(), n);
+    RequireDimension("xmin", f.xmin.size(), n);
+    RequireDimension("xmax", f.xmax.size(), n);
+    RequireDimension("low", f.low.size(), n);
+    RequireDimension("upp", f.upp.size(), n);
+    RequireDimension("dfdx", f.dfdx.size(), n);
+    RequireDimension("gx", f.gx.size(), m);
+    RequireDimension("dgdx", f.dgdx.size(), nm);
+    RequireDimension("a", f.a.size(), m);
+    RequireDimension("c", f.c.size(), m);
+    RequireDimension("d", f.d.size(), m);
+
+    if (f.problem.n != f.n || f.problem.m != f.m) {
+        throw std::runtime_error(
+            "INVALID_FIXTURE_DIMENSION: SubsolvProblem header disagrees with fixture header");
+    }
+    RequireDimension("problem.low", f.problem.low.size(), n);
+    RequireDimension("problem.upp", f.problem.upp.size(), n);
+    RequireDimension("problem.alfa", f.problem.alfa.size(), n);
+    RequireDimension("problem.beta", f.problem.beta.size(), n);
+    RequireDimension("problem.p0", f.problem.p0.size(), n);
+    RequireDimension("problem.q0", f.problem.q0.size(), n);
+    RequireDimension("problem.P", f.problem.P.size(), nm);
+    RequireDimension("problem.Q", f.problem.Q.size(), nm);
+    RequireDimension("problem.a", f.problem.a.size(), m);
+    RequireDimension("problem.b", f.problem.b.size(), m);
+    RequireDimension("problem.c", f.problem.c.size(), m);
+    RequireDimension("problem.d", f.problem.d.size(), m);
+
+    RequireDimension("result.x", f.result.x.size(), n);
+    RequireDimension("result.y", f.result.y.size(), m);
+    RequireDimension("result.lam", f.result.lam.size(), m);
+    RequireDimension("result.xsi", f.result.xsi.size(), n);
+    RequireDimension("result.eta", f.result.eta.size(), n);
+    RequireDimension("result.mu", f.result.mu.size(), m);
+    RequireDimension("result.s", f.result.s.size(), m);
+    RequireDimension("residual.rex_values", f.result.residual.rex_values.size(), n);
+    RequireDimension("residual.rey_values", f.result.residual.rey_values.size(), m);
+    RequireDimension("residual.relam_values", f.result.residual.relam_values.size(), m);
+    RequireDimension("residual.rexsi_values", f.result.residual.rexsi_values.size(), n);
+    RequireDimension("residual.reeta_values", f.result.residual.reeta_values.size(), n);
+    RequireDimension("residual.remu_values", f.result.residual.remu_values.size(), m);
+    RequireDimension("residual.res_values", f.result.residual.res_values.size(), m);
+}
+
 void VerifyResult(const SubsolvResult& expected, const SubsolvResult& actual,
                   double tolerance) {
     RequireVector(expected.x, actual.x, tolerance, "x");
@@ -770,11 +990,21 @@ MmaReplayFixture ReadMmaReplayFixture(const std::string& path) {
     f.after_rejection_design_hash = ReadPod<std::uint64_t>(in);
     f.before_history_hash = ReadPod<std::uint64_t>(in); f.candidate_history_hash = ReadPod<std::uint64_t>(in);
     f.after_rollback_history_hash = ReadPod<std::uint64_t>(in); f.update_rejected = ReadPod<bool>(in);
+    ValidateMmaReplayFixtureDimensions(f);
     return f;
 }
 
 void VerifyMmaReplayFixture(const MmaReplayFixture& fixture, double tolerance) {
-    const SubsolvResult actual = SolveSubsolvFull(fixture.problem);
+    ValidateMmaReplayFixtureDimensions(fixture);
+    // Version-1 captures predate the soft-cap extension and intentionally
+    // replay the historical 200-step boundary. This preserves compatibility
+    // of the immutable replay artifact while the production call uses the
+    // extended policy.
+    SubsolvSolveOptions legacy_options;
+    legacy_options.inner_iteration_cap = SubsolvConstants::InnerIterationCap();
+    legacy_options.stop_on_hard_cap = false;
+    const SubsolvResult actual =
+        SolveSubsolvFull(fixture.problem, legacy_options);
     VerifyResult(fixture.result, actual, tolerance);
 }
 

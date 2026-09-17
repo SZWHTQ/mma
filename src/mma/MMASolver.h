@@ -84,6 +84,8 @@ enum class DualSolveStatus {
  */
 struct DualSolveDiagnostics {
     DualSolveStatus status = DualSolveStatus::NotRun;
+    /// Detailed status of the full primal-dual stage solver.
+    SubsolvSolveStatus subsolv_status = SubsolvSolveStatus::NotRun;
 
     /// Final dual variables of the returned point.
     std::vector<double> lambda;
@@ -97,6 +99,9 @@ struct DualSolveDiagnostics {
     int barrier_levels = 0;
     int capped_barrier_levels = 0;
     int inner_newton_iterations = 0;
+    int extended_barrier_levels = 0;
+    int max_newton_iterations_per_barrier = 0;
+    int extra_newton_iterations = 0;
 
     /// Structural checks of the returned state.
     bool all_finite = false;
@@ -179,6 +184,9 @@ class MMASolver {
     }
     DualSolveStatus GetDualSolveStatus() const noexcept {
         return m_dual.status;
+    }
+    SubsolvSolveStatus GetSubsolvSolveStatus() const noexcept {
+        return m_dual.subsolv_status;
     }
     /// True only when the most recent Update() produced a qualified dual point.
     bool LastDualSolveSucceeded() const noexcept {
