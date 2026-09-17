@@ -24,9 +24,40 @@
 #include "MMASolver.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
+#include <cstdint>
+#include <cstring>
 
 namespace mma {
+
+namespace {
+
+std::uint64_t HashBytes(std::uint64_t hash, const void* data, std::size_t size) {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+std::uint64_t HashVector(std::uint64_t hash, const std::vector<double>& values) {
+    const std::uint64_t size = values.size();
+    hash = HashBytes(hash, &size, sizeof(size));
+    return values.empty() ? hash : HashBytes(hash, values.data(), values.size() * sizeof(double));
+}
+
+std::uint64_t HashHistory(int iter, const std::vector<double>& xold1,
+                         const std::vector<double>& xold2,
+                         const std::vector<double>& low,
+                         const std::vector<double>& upp) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    hash = HashBytes(hash, &iter, sizeof(iter));
+    hash = HashVector(hash, xold1); hash = HashVector(hash, xold2);
+    hash = HashVector(hash, low); hash = HashVector(hash, upp);
+    return hash;
+}
+
+} // namespace
 ////////////////////////////////////////////////////////////////////////////////
 // PUBLIC
 ////////////////////////////////////////////////////////////////////////////////
@@ -42,9 +73,11 @@ MMASolver::MMASolver(int nn, int mm, double ai, double ci, double di)
       ,
       asyminc(1.2) // 1.08;
       ,
-      a(m, ai), c(m, ci), d(m, di), y(m), lam(m), mu(m), s(2 * m), low(n),
+      a(m, ai), c(m, ci), d(m, di), y(m), lam(m), mu(m), low(n),
       upp(n), alpha(n), beta(n), p0(n), q0(n), pij(n * m), qij(n * m), b(m),
-      grad(m), hess(m * m), xold1(n), xold2(n) {}
+      xold1(n), xold2(n), m_committed_xold1(n),
+      m_committed_xold2(n), m_committed_low(n), m_committed_upp(n),
+      m_input_x(n) {}
 
 void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 
@@ -56,21 +89,13 @@ void MMASolver::SetAsymptotes(double init, double decrease, double increase) {
 
 void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
                        const double* dgdx, const double* xmin,
-                       const double* xmax, const double* move_scale) {
-    // Validate before changing solver history (and outside OpenMP regions).
-    if (move_scale) {
-        for (int i = 0; i < n; ++i) {
-            if (!std::isfinite(move_scale[i]) || move_scale[i] <= 0.0 ||
-                move_scale[i] > 1.0) {
-                throw std::invalid_argument("MMA local-bound scale must be finite and in (0, 1]");
-            }
-        }
-    }
-    last_bounds.alpha_standard.resize(n);
-    last_bounds.beta_standard.resize(n);
-    GenSub(xval, dfdx, gx, dgdx, xmin, xmax, move_scale);
-    last_bounds.alpha = alpha;
-    last_bounds.beta = beta;
+                       const double* xmax) {
+    // The iteration state a solve is allowed to commit. Captured before GenSub
+    // so that a rejected solve can be undone exactly.
+    SnapshotIterationState(xval);
+
+    // Generate the subproblem
+    GenSub(xval, dfdx, gx, dgdx, xmin, xmax);
 
     // Update xolds
     xold2 = xold1;
@@ -81,266 +106,201 @@ void MMASolver::Update(double* xval, const double* dfdx, const double* gx,
 
     // Solve the dual with a steepest ascent method
     // SolveDSA(xval);
+
+    // Observe the returned dual point, then accept or reject it. A rejected
+    // solve restores the iteration state captured above and leaves the caller's
+    // design vector untouched, so a failed subproblem cannot advance the
+    // asymptote history or propose a garbage design step.
+    QualifyDualSolve(xval);
+    m_replay_capture.candidate_design_hash =
+        HashBytes(1469598103934665603ULL, xval, sizeof(double) * n);
+    m_replay_capture.candidate_history_hash =
+        HashHistory(iter, xold1, xold2, low, upp);
+    if (m_dual.status != DualSolveStatus::Success) {
+        RestoreIterationState(xval);
+    }
+    m_replay_capture.after_rejection_design_hash =
+        HashBytes(1469598103934665603ULL, xval, sizeof(double) * n);
+    m_replay_capture.after_rollback_history_hash =
+        HashHistory(iter, xold1, xold2, low, upp);
+    m_replay_capture.update_rejected = m_dual.update_rejected;
+    if (m_replay_callback) m_replay_callback(m_replay_capture);
+}
+
+void MMASolver::SnapshotIterationState(const double* xval) {
+    m_dual.update_rejected = false;
+    m_committed_iter = iter;
+    m_committed_xold1 = xold1;
+    m_committed_xold2 = xold2;
+    m_committed_low = low;
+    m_committed_upp = upp;
+    m_input_x.assign(xval, xval + n);
+    m_replay_capture = MmaReplayFixture{};
+    m_replay_capture.iteration = iter;
+    m_replay_capture.update_number = iter + 1;
+    m_replay_capture.n = n;
+    m_replay_capture.m = m;
+    m_replay_capture.xval = m_input_x;
+    m_replay_capture.xold1 = xold1;
+    m_replay_capture.xold2 = xold2;
+    m_replay_capture.low = low;
+    m_replay_capture.upp = upp;
+    m_replay_capture.a = a;
+    m_replay_capture.c = c;
+    m_replay_capture.d = d;
+    m_replay_capture.a0 = 1.0;
+    m_replay_capture.epsimin = epsimin;
+    m_replay_capture.xmamieps = xmamieps;
+    m_replay_capture.raa0 = raa0;
+    m_replay_capture.move = move;
+    m_replay_capture.albefa = albefa;
+    m_replay_capture.asyminit = asyminit;
+    m_replay_capture.asymdec = asymdec;
+    m_replay_capture.asyminc = asyminc;
+    m_replay_capture.before_design_hash =
+        HashBytes(1469598103934665603ULL, xval, sizeof(double) * n);
+    m_replay_capture.before_history_hash = HashHistory(iter, xold1, xold2, low, upp);
+}
+
+void MMASolver::RestoreIterationState(double* xval) {
+    iter = m_committed_iter;
+    xold1 = m_committed_xold1;
+    xold2 = m_committed_xold2;
+    low = m_committed_low;
+    upp = m_committed_upp;
+    std::copy_n(m_input_x.begin(), n, xval);
+    m_dual.update_rejected = true;
+}
+
+/**
+ * Qualify the dual point SolveDIP returned. This is a pure observation: it reads
+ * the solver state and fills m_dual, and changes nothing the arithmetic depends
+ * on.
+ */
+void MMASolver::QualifyDualSolve(const double* x) {
+    m_dual.lambda = lam;
+    m_dual.mu = mu;
+    m_dual.epsimin = epsimin;
+
+    bool all_finite = std::isfinite(z);
+    for (int j = 0; j < m && all_finite; ++j) {
+        all_finite = std::isfinite(lam[j]) && std::isfinite(mu[j]) &&
+                     std::isfinite(y[j]);
+    }
+    for (int i = 0; i < n && all_finite; ++i) {
+        all_finite = std::isfinite(x[i]);
+    }
+    m_dual.all_finite = all_finite;
+
+    // XYZofLAMBDA clamps the primal iterate into [alpha, beta], so this holds by
+    // construction for any finite iterate; the check exists to catch a
+    // non-finite or otherwise corrupted box, not to re-derive the clamp.
+    bool within_box = true;
+    for (int i = 0; i < n; ++i) {
+        const double width = std::abs(beta[i] - alpha[i]);
+        const double tol = 1.0e-12 * std::max(1.0, width);
+        if (x[i] < alpha[i] - tol || x[i] > beta[i] + tol) {
+            within_box = false;
+        }
+    }
+    m_dual.design_within_subproblem_box = within_box;
+
+    const bool finite_ok = all_finite && m_dual.all_finite;
+
+    // ---- the m9 acceptance policy -----------------------------------
+    //
+    // Acceptance is decided by the quality of the returned point, not by how
+    // the solver got there. `capped_barrier_levels` stays observable but is
+    // NOT a failure clause on its own: m8 measured a fixture that saturates the
+    // inner cap and still delivers a residual 3e4x inside the threshold while
+    // converging to the analytic optimum (§9, G6).
+    //
+    // Structural clauses, any of which is fatal whatever the residual:
+    //   * every returned state entry is finite;
+    //   * the point lies inside its own domain (alfa <= x <= beta,
+    //     y,z,lam,mu,s,zet >= 0);
+    //   * the reference's Newton branch was taken as written.
+    // Quality clause: the full primal-dual KKT/barrier residual, which is the
+    // solver's own convergence measure, within `KktResidualToleranceFactor()`
+    // times epsimin.
+    m_dual.kkt_residual_tolerance = KktResidualToleranceFactor() * epsimin;
+    const bool kkt_ok = m_dual.kkt.max_norm <= m_dual.kkt_residual_tolerance &&
+                        std::isfinite(m_dual.kkt.max_norm);
+    const bool structural_ok = finite_ok && within_box &&
+                               m_dual.kkt_domain_ok &&
+                               !m_dual.kkt_unsupported_branch;
+
+    m_dual.status = (structural_ok && kkt_ok) ? DualSolveStatus::Success
+                                              : DualSolveStatus::FailedToConverge;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // PRIVATE
 ////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * The solve path (m9): hand the generated subproblem to the full primal-dual
+ * solver and adopt what it returns.
+ *
+ * GenSub is untouched and produces exactly the quantities `subsolv.m` takes.
+ * The only conversion is the layout of P/Q: production stores them as
+ * `pij[i*m + j]` (design index i, constraint index j), the reference as
+ * `P(i,j)` with i the constraint, so the two are transposes of each other.
+ */
 void MMASolver::SolveDIP(double* x) {
-
-    for (int j = 0; j < m; j++) {
-        lam[j] = c[j] / 2.0;
-        mu[j] = 1.0;
-    }
-
-    const double tol = epsimin; // 1.0e-9*sqrt(m+n);
-    double epsi = 1.0;
-    double err = 1.0;
-    int loop;
-
-    while (epsi > tol) {
-
-        loop = 0;
-        while (err > 0.9 * epsi && loop < 100) {
-            loop++;
-
-            // Set up Newton system
-            XYZofLAMBDA(x);
-            DualGrad(x);
-            for (int j = 0; j < m; j++) {
-                grad[j] = -1.0 * grad[j] - epsi / lam[j];
-            }
-            DualHess(x);
-
-            // Solve Newton system
-            if (m > 1) {
-                Factorize(hess.data(), m);
-                Solve(hess.data(), grad.data(), m);
-                for (int j = 0; j < m; j++) {
-                    s[j] = grad[j];
-                }
-            } else if (m > 0) {
-                s[0] = grad[0] / hess[0];
-            }
-
-            // Get the full search direction
-            for (int i = 0; i < m; i++) {
-                s[m + i] = -mu[i] + epsi / lam[i] - s[i] * mu[i] / lam[i];
-            }
-
-            // Perform linesearch and update lam and mu
-            DualLineSearch();
-
-            XYZofLAMBDA(x);
-
-            // Compute KKT res
-            err = DualResidual(x, epsi);
-        }
-        epsi = epsi * 0.1;
-    }
-}
-
-void MMASolver::SolveDSA(double* x) {
-
-    for (int j = 0; j < m; j++) {
-        lam[j] = 1.0;
-    }
-
-    const double tol = epsimin; // 1.0e-9*sqrt(m+n);
-    double err = 1.0;
-    int loop = 0;
-
-    while (err > tol && loop < 500) {
-        loop++;
-        XYZofLAMBDA(x);
-        DualGrad(x);
-        double theta = 1.0;
-        err = 0.0;
-        for (int j = 0; j < m; j++) {
-            lam[j] = std::max(0.0, lam[j] + theta * grad[j]);
-            err += grad[j] * grad[j];
-        }
-        err = std::sqrt(err);
-    }
-}
-
-double MMASolver::DualResidual(double* x, double epsi) {
-
-    double* res = new double[2 * m];
-
-    for (int j = 0; j < m; j++) {
-        res[j] = -b[j] - a[j] * z - y[j] + mu[j];
-        res[j + m] = mu[j] * lam[j] - epsi;
-        for (int i = 0; i < n; i++) {
-            res[j] += pij[i * m + j] / (upp[i] - x[i]) +
-                      qij[i * m + j] / (x[i] - low[i]);
+    SubsolvProblem sp;
+    sp.n = n;
+    sp.m = m;
+    sp.epsimin = epsimin;
+    sp.low = low;
+    sp.upp = upp;
+    sp.alfa = alpha;
+    sp.beta = beta;
+    sp.p0 = p0;
+    sp.q0 = q0;
+    sp.P.assign(static_cast<std::size_t>(m) * n, 0.0);
+    sp.Q.assign(static_cast<std::size_t>(m) * n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < m; ++j) {
+            sp.P[static_cast<std::size_t>(j) * n + i] = pij[i * m + j];
+            sp.Q[static_cast<std::size_t>(j) * n + i] = qij[i * m + j];
         }
     }
+    sp.a0 = 1.0;  // production's XYZofLAMBDA encodes a0 = 1
+    sp.a = a;
+    sp.b = b;
+    sp.c = c;
+    sp.d = d;
 
-    double nrI = 0.0;
-    for (int i = 0; i < 2 * m; i++) {
-        if (nrI < std::abs(res[i])) {
-            nrI = std::abs(res[i]);
-        }
+    m_replay_capture.problem = sp;
+    if (m_replay_pre_solve_callback) m_replay_pre_solve_callback(m_replay_capture);
+
+    const SubsolvResult r = SolveSubsolvFull(sp);
+
+    m_replay_capture.result = r;
+
+    if (r.x.size() == static_cast<std::size_t>(n)) {
+        std::copy(r.x.begin(), r.x.end(), x);
     }
+    lam = r.lam;
+    mu = r.mu;
+    y = r.y;
+    z = r.z;
 
-    delete[] res;
-
-    return nrI;
-}
-
-void MMASolver::DualLineSearch() {
-
-    double theta = 1.005;
-    for (int i = 0; i < m; i++) {
-        if (theta < -1.01 * s[i] / lam[i]) {
-            theta = -1.01 * s[i] / lam[i];
-        }
-        if (theta < -1.01 * s[i + m] / mu[i]) {
-            theta = -1.01 * s[i + m] / mu[i];
-        }
-    }
-    theta = 1.0 / theta;
-
-    for (int i = 0; i < m; i++) {
-        lam[i] = lam[i] + theta * s[i];
-        mu[i] = mu[i] + theta * s[i + m];
-    }
-}
-
-void MMASolver::DualHess(double* x) {
-
-    double* df2 = new double[n];
-    double* PQ = new double[n * m];
-#ifdef MMA_WITH_OPENMP
-#pragma omp parallel for
-#endif
-    for (int i = 0; i < n; i++) {
-        double pjlam = p0[i];
-        double qjlam = q0[i];
-        for (int j = 0; j < m; j++) {
-            pjlam += pij[i * m + j] * lam[j];
-            qjlam += qij[i * m + j] * lam[j];
-            PQ[i * m + j] = pij[i * m + j] / pow(upp[i] - x[i], 2.0) -
-                            qij[i * m + j] / pow(x[i] - low[i], 2.0);
-        }
-        df2[i] = -1.0 / (2.0 * pjlam / pow(upp[i] - x[i], 3.0) +
-                         2.0 * qjlam / pow(x[i] - low[i], 3.0));
-        double xp = (sqrt(pjlam) * low[i] + sqrt(qjlam) * upp[i]) /
-                    (sqrt(pjlam) + sqrt(qjlam));
-        if (xp < alpha[i]) {
-            df2[i] = 0.0;
-        }
-        if (xp > beta[i]) {
-            df2[i] = 0.0;
-        }
-    }
-
-    // Create the matrix/matrix/matrix product: PQ^T * diag(df2) * PQ
-    double* tmp = new double[n * m];
-    for (int j = 0; j < m; j++) {
-#ifdef MMA_WITH_OPENMP
-#pragma omp parallel for
-#endif
-        for (int i = 0; i < n; i++) {
-            tmp[j * n + i] = 0.0;
-            tmp[j * n + i] += PQ[i * m + j] * df2[i];
-        }
-    }
-
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < m; j++) {
-            hess[i * m + j] = 0.0;
-            for (int k = 0; k < n; k++) {
-                hess[i * m + j] += tmp[i * n + k] * PQ[k * m + j];
-            }
-        }
-    }
-
-    double lamai = 0.0;
-    for (int j = 0; j < m; j++) {
-        if (lam[j] < 0.0) {
-            lam[j] = 0.0;
-        }
-        lamai += lam[j] * a[j];
-        if (lam[j] > c[j]) {
-            hess[j * m + j] += -1.0;
-        }
-        hess[j * m + j] += -mu[j] / lam[j];
-    }
-
-    if (lamai > 0.0) {
-        for (int j = 0; j < m; j++) {
-            for (int k = 0; k < m; k++) {
-                hess[j * m + k] += -10.0 * a[j] * a[k];
-            }
-        }
-    }
-
-    // pos def check
-    double HessTrace = 0.0;
-    for (int i = 0; i < m; i++) {
-        HessTrace += hess[i * m + i];
-    }
-    double HessCorr = 1e-4 * HessTrace / m;
-
-    if (-1.0 * HessCorr < 1.0e-7) {
-        HessCorr = -1.0e-7;
-    }
-
-    for (int i = 0; i < m; i++) {
-        hess[i * m + i] += HessCorr;
-    }
-
-    delete[] df2;
-    delete[] PQ;
-    delete[] tmp;
-}
-
-void MMASolver::DualGrad(double* x) {
-    for (int j = 0; j < m; j++) {
-        grad[j] = -b[j] - a[j] * z - y[j];
-        for (int i = 0; i < n; i++) {
-            grad[j] += pij[i * m + j] / (upp[i] - x[i]) +
-                       qij[i * m + j] / (x[i] - low[i]);
-        }
-    }
-}
-
-void MMASolver::XYZofLAMBDA(double* x) {
-
-    double lamai = 0.0;
-    for (int i = 0; i < m; i++) {
-        if (lam[i] < 0.0) {
-            lam[i] = 0;
-        }
-        y[i] = std::max(
-            0.0,
-            lam[i] - c[i]); // Note y=(lam-c)/d - however d is fixed at one !!
-        lamai += lam[i] * a[i];
-    }
-    z = std::max(0.0, 10.0 * (lamai - 1.0)); // SINCE a0 = 1.0
-
-#ifdef MMA_WITH_OPENMP
-#pragma omp parallel for
-#endif
-    for (int i = 0; i < n; i++) {
-        double pjlam = p0[i];
-        double qjlam = q0[i];
-        for (int j = 0; j < m; j++) {
-            pjlam += pij[i * m + j] * lam[j];
-            qjlam += qij[i * m + j] * lam[j];
-        }
-        x[i] = (sqrt(pjlam) * low[i] + sqrt(qjlam) * upp[i]) /
-               (sqrt(pjlam) + sqrt(qjlam));
-        if (x[i] < alpha[i]) {
-            x[i] = alpha[i];
-        }
-        if (x[i] > beta[i]) {
-            x[i] = beta[i];
-        }
-    }
+    // Counters and residuals, for QualifyDualSolve.
+    m_dual.barrier_levels = r.barrier_levels;
+    m_dual.capped_barrier_levels = r.capped_barrier_levels;
+    m_dual.inner_newton_iterations = r.inner_newton_iterations;
+    m_dual.epsi_final = r.epsi_final;
+    m_dual.all_finite = r.all_finite;
+    m_dual.kkt = r.residual;
+    m_dual.kkt_domain_ok = r.domain_ok;
+    m_dual.kkt_unsupported_branch = r.unsupported_branch;
+    m_dual.full_step_iterations = r.full_step_iterations;
+    m_dual.backtracking_iterations = r.backtracking_iterations;
+    m_dual.backtracking_reductions = r.backtracking_reductions;
+    m_dual.backtracking_max_reductions = r.backtracking_max_reductions;
+    m_dual.backtracking_exhausted = r.backtracking_exhausted;
 }
 
 void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
@@ -348,6 +308,11 @@ void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
                        const double* xmax, const double* move_scale) {
     // Forward the iterator
     iter++;
+    m_replay_capture.dfdx.assign(dfdx, dfdx + n);
+    m_replay_capture.gx.assign(gx, gx + m);
+    m_replay_capture.dgdx.assign(dgdx, dgdx + n * m);
+    m_replay_capture.xmin.assign(xmin, xmin + n);
+    m_replay_capture.xmax.assign(xmax, xmax + n);
 
     // Set asymptotes
     if (iter < 3) {
@@ -449,35 +414,4 @@ void MMASolver::GenSub(const double* xval, const double* dfdx, const double* gx,
     }
 }
 
-void MMASolver::Factorize(double* K, int n) {
-
-    for (int s = 0; s < n - 1; s++) {
-        for (int i = s + 1; i < n; i++) {
-            K[i * n + s] = K[i * n + s] / K[s * n + s];
-            for (int j = s + 1; j < n; j++) {
-                K[i * n + j] = K[i * n + j] - K[i * n + s] * K[s * n + j];
-            }
-        }
-    }
-}
-
-void MMASolver::Solve(double* K, double* x, int n) {
-
-    for (int i = 1; i < n; i++) {
-        double a = 0.0;
-        for (int j = 0; j < i; j++) {
-            a = a - K[i * n + j] * x[j];
-        }
-        x[i] = x[i] + a;
-    }
-
-    x[n - 1] = x[n - 1] / K[(n - 1) * n + (n - 1)];
-    for (int i = n - 2; i >= 0; i--) {
-        double a = x[i];
-        for (int j = i + 1; j < n; j++) {
-            a = a - K[i * n + j] * x[j];
-        }
-        x[i] = a / K[i * n + i];
-    }
-}
 } // namespace mma
