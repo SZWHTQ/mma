@@ -51,6 +51,8 @@ enum class SubsolvSolveStatus {
     NotRun,
     ConvergedWithinSoftCap,
     ConvergedAfterSoftCapExtension,
+    StagnatedAfterSoftCapExtension,
+    EmergencyWorkLimitExhausted,
     HardCapExhausted,
     NumericalFailure,
     DomainFailure,
@@ -134,6 +136,27 @@ struct SubsolvTraceRecord {
     bool linear_system_ok = true;
 };
 
+/** Policy decision after the normal per-stage work budget is exhausted. */
+enum class SubsolvProgressDecision {
+    Continue,
+    Stagnated,
+};
+
+/**
+ * Scale-insensitive, solver-level progress monitor. The history is indexed by
+ * Newton iteration within one barrier stage and contains the full residual
+ * 2-norm, including the stage-start value at index zero.
+ */
+struct SubsolvProgressPolicy {
+    int window = 20;
+    int consecutive_windows = 2;
+    double minimum_relative_reduction = 1.0e-6;
+
+    SubsolvProgressDecision Decide(const std::vector<double>& residual_history,
+                                   int iteration,
+                                   int soft_budget) const noexcept;
+};
+
 /** Explicitly opt-in diagnostic controls; defaults select the production policy. */
 struct SubsolvSolveOptions {
     // Zero selects the production policy (200-iteration soft cap and the
@@ -142,6 +165,10 @@ struct SubsolvSolveOptions {
     // Diagnostic-only compatibility mode: retain later barrier records after
     // a deliberately low cap, but still return HardCapExhausted.
     bool stop_on_hard_cap = true;
+    // Defaults enable the progress-aware production policy. Positive
+    // inner_iteration_cap remains an explicit historical/diagnostic cap and
+    // disables progress-aware termination for replay compatibility.
+    SubsolvProgressPolicy progress_policy;
     std::function<void(const SubsolvTraceRecord&)> trace;
 };
 
@@ -180,6 +207,12 @@ struct SubsolvResult {
     int max_newton_iterations_per_barrier = 0;
     /// Newton iterations performed after soft-cap saturation.
     int extra_newton_iterations = 0;
+    /// Barrier levels explicitly stopped after persistent lack of progress.
+    int stagnated_barrier_levels = 0;
+    /// Barrier levels stopped by the generous emergency work limit.
+    int emergency_limited_barrier_levels = 0;
+    /// Last measured relative reduction when a stage was classified stagnant.
+    double stagnation_relative_reduction = 0.0;
 
     int backtracking_iterations = 0;   ///< Newton iterations needing >=1 halving
     int backtracking_reductions = 0;   ///< halvings summed over the solve
@@ -279,8 +312,11 @@ void VerifyMmaReplayFixture(const MmaReplayFixture& fixture,
 struct SubsolvConstants {
     /// Historical per-stage work budget, `ittt < 200` (subsolv.m line 87).
     static int InnerIterationCap() noexcept { return 200; }
-    /// Absolute per-stage safety ceiling for the extended policy.
+    /// Historical absolute cap retained for explicit diagnostic modes.
     static int HardIterationCap() noexcept { return 1100; }
+    /// Runaway guard for the progress-aware production policy. This is not a
+    /// normal convergence/failure criterion.
+    static int EmergencyWorkLimit() noexcept { return 10000; }
     /// Backtracking budget, `itto < 50` (subsolv.m line 175).
     static int BacktrackingReductionLimit() noexcept { return 50; }
     /// Barrier reduction, `epsi = 0.1*epsi` (subsolv.m line 219).

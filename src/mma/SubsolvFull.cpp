@@ -135,6 +135,35 @@ double SubsolvResidual::worst_component() const {
     return std::max({rex, rey, rez, relam, rexsi, reeta, remu, rezet, res});
 }
 
+SubsolvProgressDecision SubsolvProgressPolicy::Decide(
+    const std::vector<double>& residual_history, int iteration,
+    int soft_budget) const noexcept {
+    if (window <= 0 || consecutive_windows <= 0 ||
+        minimum_relative_reduction < 0.0 || iteration < 0 ||
+        iteration < soft_budget + window * consecutive_windows ||
+        residual_history.size() <= static_cast<std::size_t>(iteration)) {
+        return SubsolvProgressDecision::Continue;
+    }
+    for (int w = 0; w < consecutive_windows; ++w) {
+        const int newer = iteration - w * window;
+        const int older = newer - window;
+        if (older < 0 ||
+            residual_history.size() <= static_cast<std::size_t>(older) ||
+            !std::isfinite(residual_history[older]) ||
+            !std::isfinite(residual_history[newer]) ||
+            !(residual_history[older] > 0.0)) {
+            return SubsolvProgressDecision::Continue;
+        }
+        const double relative_reduction =
+            (residual_history[older] - residual_history[newer]) /
+            residual_history[older];
+        if (!(relative_reduction <= minimum_relative_reduction)) {
+            return SubsolvProgressDecision::Continue;
+        }
+    }
+    return SubsolvProgressDecision::Stagnated;
+}
+
 SubsolvResidual EvaluateSubsolvResidual(const SubsolvProblem& p,
                                         const SubsolvResult& q, double epsi) {
     const int n = p.n, m = p.m;
@@ -229,13 +258,16 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
     const int n = p.n, m = p.m;
     const double epsimin = p.epsimin;
     const int soft_iteration_cap = SubsolvConstants::InnerIterationCap();
-    const int hard_iteration_cap = options.inner_iteration_cap > 0
+    const bool explicit_cap = options.inner_iteration_cap > 0;
+    const int hard_iteration_cap = explicit_cap
                                        ? options.inner_iteration_cap
-                                       : SubsolvConstants::HardIterationCap();
+                                       : SubsolvConstants::EmergencyWorkLimit();
     SubsolvResult out;
     bool numerical_failure = false;
     bool domain_failure = false;
     bool hard_cap_exhausted = false;
+    bool emergency_work_limit_exhausted = false;
+    bool stagnated = false;
 
     // ---- 1. primal-dual initialization (subsolv.m 42-58) ----
     std::vector<double> x(n), y(m), lam(m), xsi(n), eta(n), mu(m), s(m);
@@ -275,6 +307,7 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
         out.epsi_final = epsi;
         int ittt = 0;
         bool stage_extended = false;
+        std::vector<double> stage_residual_history{residunorm};
 
         {
             SubsolvResult cur;
@@ -614,6 +647,26 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
             EmitTrace(options, record);
             steg = 2.0 * steg;
 
+            stage_residual_history.push_back(residunorm);
+            if (!explicit_cap &&
+                residumax > SubsolvConstants::InnerResidualFactor() * epsi &&
+                options.progress_policy.Decide(stage_residual_history, ittt,
+                                               soft_iteration_cap) ==
+                    SubsolvProgressDecision::Stagnated) {
+                stagnated = true;
+                out.stagnated_barrier_levels += 1;
+                const int w = options.progress_policy.window;
+                if (w > 0 && ittt >= w) {
+                    const double old_residual = stage_residual_history[ittt - w];
+                    const double new_residual = stage_residual_history[ittt];
+                    if (old_residual > 0.0) {
+                        out.stagnation_relative_reduction =
+                            (old_residual - new_residual) / old_residual;
+                    }
+                }
+                break;
+            }
+
             if (!std::isfinite(rr.max_norm) || !std::isfinite(rr.norm2)) {
                 numerical_failure = true;
                 break;
@@ -628,13 +681,19 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
                 std::max(0, ittt - soft_iteration_cap);
         }
 
-        // The soft cap is only a work-budget boundary. Exhaustion of the
-        // absolute ceiling is an explicit failure, never normal completion.
-        if (!numerical_failure && !domain_failure &&
+        // The soft cap is only a work-budget boundary. Explicit diagnostic
+        // caps retain their historical failure semantics. In production, the
+        // absolute ceiling is an emergency guard, never normal termination.
+        if (!numerical_failure && !domain_failure && !stagnated &&
             ittt >= hard_iteration_cap &&
             residumax > SubsolvConstants::InnerResidualFactor() * epsi) {
-            out.capped_barrier_levels += 1;
-            hard_cap_exhausted = true;
+            if (explicit_cap) {
+                out.capped_barrier_levels += 1;
+                hard_cap_exhausted = true;
+            } else {
+                out.emergency_limited_barrier_levels += 1;
+                emergency_work_limit_exhausted = true;
+            }
         }
 
         {
@@ -659,7 +718,8 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
 
         // ---- 11. next barrier level (subsolv.m 219) ----
         epsi = epsi * SubsolvConstants::BarrierReduction();
-        if (numerical_failure || domain_failure ||
+        if (numerical_failure || domain_failure || stagnated ||
+            emergency_work_limit_exhausted ||
             (hard_cap_exhausted && options.stop_on_hard_cap)) {
             break;
         }
@@ -694,6 +754,10 @@ SubsolvResult SolveSubsolvFull(const SubsolvProblem& p,
         out.status = SubsolvSolveStatus::NumericalFailure;
     } else if (domain_failure || !out.domain_ok) {
         out.status = SubsolvSolveStatus::DomainFailure;
+    } else if (emergency_work_limit_exhausted) {
+        out.status = SubsolvSolveStatus::EmergencyWorkLimitExhausted;
+    } else if (stagnated) {
+        out.status = SubsolvSolveStatus::StagnatedAfterSoftCapExtension;
     } else if (hard_cap_exhausted) {
         out.status = SubsolvSolveStatus::HardCapExhausted;
     } else if (out.extended_barrier_levels > 0) {
